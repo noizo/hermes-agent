@@ -358,6 +358,10 @@ compression:
 #   include_handoff: true
 #   include_symbols: true
 #   include_callers: true
+#   # Also expose lean-ctx as an extra bridge MCP server for Claude/Cursor
+#   # delegate_task workers when the native bridge transport is active.
+#   expose_to_bridge_workers: true
+#   bridge_mcp_server_name: lean-ctx
 #   max_chars: 12000
 #   # Caps only the lean-ctx packet added to delegated child tasks.
 #   delegation_max_chars: 6000

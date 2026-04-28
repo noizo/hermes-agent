@@ -244,6 +244,15 @@ def get_session_savings() -> dict[str, int]:
     }
 
 
+def is_runtime_active() -> bool:
+    """Return whether lean-ctx routing is currently enabled and available."""
+    try:
+        cfg = _load_routing_config()
+        return bool(cfg.enabled and _available(cfg))
+    except Exception:
+        return False
+
+
 def reset_session_savings() -> None:
     """Reset process-local counters when Hermes starts a fresh session."""
     with _LEAN_STATS_LOCK:

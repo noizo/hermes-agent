@@ -3187,10 +3187,11 @@ class HermesCLI:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
         try:
-            from tools.lean_ctx_router import get_session_savings
+            from tools.lean_ctx_router import get_session_savings, is_runtime_active
 
             lean_ctx = get_session_savings()
-            if lean_ctx.get("tokens_saved", 0) > 0:
+            if lean_ctx.get("tokens_saved", 0) > 0 or is_runtime_active():
+                lean_ctx = {**lean_ctx, "active": True}
                 snapshot["lean_ctx"] = lean_ctx
         except Exception:
             pass
@@ -3203,10 +3204,10 @@ class HermesCLI:
         if not lean_ctx:
             return ""
         saved = int(lean_ctx.get("tokens_saved") or 0)
-        if saved <= 0:
-            return ""
         rate = int(lean_ctx.get("compression_rate") or 0)
-        return f"lc {format_token_count_compact(saved)} saved · {rate}%"
+        if saved <= 0:
+            return "lctx: 0%" if lean_ctx.get("active") else ""
+        return f"lctx: {rate}%"
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:

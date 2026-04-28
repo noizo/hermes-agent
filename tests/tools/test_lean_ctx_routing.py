@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from tools import lean_ctx_router
+from tools.lean_ctx_client import LeanCtxRuntimeConfig, bridge_mcp_server_config
 
 
 def test_auto_config_waits_for_lean_ctx_binary(monkeypatch):
@@ -30,6 +31,29 @@ def test_auto_config_enables_when_lean_ctx_binary_exists(monkeypatch):
 
     assert cfg.enabled is True
     assert cfg.command == "lean-ctx"
+
+
+def test_bridge_mcp_server_config_uses_lean_ctx_runtime_config(monkeypatch):
+    import tools.lean_ctx_client as lean_ctx_client
+
+    monkeypatch.setattr(lean_ctx_client.shutil, "which", lambda command: f"/usr/local/bin/{command}")
+
+    result = bridge_mcp_server_config(
+        LeanCtxRuntimeConfig(
+            enabled=True,
+            command="lean-ctx",
+            args=("--stdio",),
+            env={"LEAN_CTX_DATA_DIR": "/tmp/lean", "SECRET": "nope"},
+            bridge_mcp_server_name="lean-ctx",
+        )
+    )
+
+    assert result is not None
+    name, server = result
+    assert name == "lean-ctx"
+    assert server["command"] == "lean-ctx"
+    assert server["args"] == ["--stdio"]
+    assert server["env"] == {"LEAN_CTX_DATA_DIR": "/tmp/lean"}
 
 
 def test_session_savings_are_extracted_from_lean_ctx_output():

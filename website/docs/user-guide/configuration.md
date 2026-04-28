@@ -104,6 +104,8 @@ lean_ctx:
   include_overview: true
   include_preload: true
   include_graph_status: true
+  expose_to_bridge_workers: true
+  bridge_mcp_server_name: lean-ctx
   max_chars: 12000
   delegation_max_chars: 6000
   max_task_chars: 4000
@@ -113,6 +115,8 @@ lean_ctx:
 Hermes keeps a small process-local savings counter for routed lean-ctx calls and shows it in the CLI status bar when non-zero, for example `lc 12.4k saved · 74%`. Use `/leanctx help` to see the native command surface. The most common diagnostics are `/leanctx savings`, `/leanctx status`, `/leanctx tools`, `/leanctx router`, `/leanctx session status`, `/leanctx memory status`, `/leanctx gain`, `/leanctx cache`, and `/leanctx doctor`. `ctx_dashboard` is a lean-ctx dashboard/server control; Hermes' TUI uses the compact status-bar metric.
 
 `max_chars` and `delegation_max_chars` cap only the lean-ctx context packet appended by Hermes. They do not truncate the user's instruction or the persona/task prompt. `max_task_chars` caps the task text sent to lean-ctx for retrieval so large instructions do not turn into oversized retrieval queries.
+
+With `expose_to_bridge_workers: true`, Hermes also adds lean-ctx to the native bridge worker MCP surface. Claude workers receive it through the generated per-session MCP config plus `bridge_extra_allowed_tools`; Cursor workers receive it through the project Cursor MCP config alongside `worker-bridge`. This is separate from the text context packet, so smoke tests should verify both the parent-routed lean-ctx context and the worker-visible lean-ctx MCP tools.
 
 ## Terminal Backend Configuration
 

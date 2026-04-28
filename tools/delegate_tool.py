@@ -44,6 +44,23 @@ from tools.delegate_personas import apply_persona_to_task
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
+_LEAN_CTX_BRIDGE_TOOL_NAMES = (
+    "ctx_read",
+    "ctx_search",
+    "ctx_tree",
+    "ctx_shell",
+    "ctx_knowledge",
+    "ctx_session",
+    "ctx_task",
+    "ctx_overview",
+    "ctx_preload",
+    "ctx_intent",
+    "ctx_graph",
+    "ctx_symbol",
+    "ctx_callers",
+    "ctx_handoff",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -2602,6 +2619,38 @@ def _configured_default_transport(cfg: Optional[Dict[str, Any]]) -> str:
     )
 
 
+def _augment_bridge_config_with_lean_ctx(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose enabled lean-ctx MCP tools to bridge workers via bridge config."""
+
+    try:
+        from hermes_cli.config import load_config
+        from tools.lean_ctx_client import (
+            bridge_mcp_server_config,
+            load_config_from_mapping,
+        )
+
+        lean_cfg = load_config_from_mapping(load_config())
+        server = bridge_mcp_server_config(lean_cfg)
+    except Exception:
+        return cfg
+    if not server:
+        return cfg
+
+    server_name, server_config = server
+    augmented = dict(cfg or {})
+    extra_servers = dict(augmented.get("bridge_extra_mcp_servers") or {})
+    extra_servers.setdefault(server_name, server_config)
+    augmented["bridge_extra_mcp_servers"] = extra_servers
+
+    allowed_tools = list(augmented.get("bridge_extra_allowed_tools") or [])
+    for tool_name in _LEAN_CTX_BRIDGE_TOOL_NAMES:
+        allowed = f"mcp__{server_name}__{tool_name}"
+        if allowed not in allowed_tools:
+            allowed_tools.append(allowed)
+    augmented["bridge_extra_allowed_tools"] = allowed_tools
+    return augmented
+
+
 def _infer_delegate_transport(
     *,
     task: Dict[str, Any],
@@ -2642,6 +2691,7 @@ def _delegate_bridge_tasks(
     results: List[Dict[str, Any]] = []
     start = time.monotonic()
     wait_seconds = float(initial_wait_seconds or cfg.get("bridge_initial_wait_seconds") or 10)
+    bridge_cfg = _augment_bridge_config_with_lean_ctx(cfg)
 
     for i, task in enumerate(task_list):
         selected_acp_command = task.get("acp_command") or top_level_acp_command
@@ -2678,7 +2728,7 @@ def _delegate_bridge_tasks(
                 acp_command=selected_acp_command,
                 acp_args=list(selected_acp_args or []),
                 unsafe_allow_writes=selected_unsafe_allow_writes,
-                cfg=cfg,
+                cfg=bridge_cfg,
                 initial_wait_seconds=wait_seconds,
             )
             results.append(

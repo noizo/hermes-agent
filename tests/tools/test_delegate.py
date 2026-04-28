@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     delegate_task,
     _infer_delegate_transport,
     _normalize_delegate_transport,
+    _augment_bridge_config_with_lean_ctx,
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
@@ -205,6 +206,31 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertIn("worker-bridge", servers)
             self.assertEqual(servers["shared-memory"]["url"], "https://memory.example.com/mcp/")
             self.assertEqual(servers["lean-ctx"]["command"], "lean-ctx")
+
+    def test_lean_ctx_augments_bridge_mcp_servers_and_claude_allowed_tools(self):
+        import hermes_cli.config as hermes_config
+        import tools.lean_ctx_client as lean_ctx_client
+
+        with patch.object(
+            hermes_config,
+            "load_config",
+            return_value={"lean_ctx": {"enabled": True, "command": "lean-ctx"}},
+        ), patch.object(lean_ctx_client.shutil, "which", return_value="/usr/local/bin/lean-ctx"):
+            cfg = _augment_bridge_config_with_lean_ctx(
+                {
+                    "bridge_extra_mcp_servers": {
+                        "shared-memory": {"type": "http", "url": "https://memory.example.com/mcp/"}
+                    },
+                    "bridge_extra_allowed_tools": ["mcp__shared-memory__recall"],
+                }
+            )
+
+        servers = cfg["bridge_extra_mcp_servers"]
+        self.assertIn("shared-memory", servers)
+        self.assertEqual(servers["lean-ctx"]["command"], "lean-ctx")
+        self.assertIn("mcp__shared-memory__recall", cfg["bridge_extra_allowed_tools"])
+        self.assertIn("mcp__lean-ctx__ctx_read", cfg["bridge_extra_allowed_tools"])
+        self.assertIn("mcp__lean-ctx__ctx_knowledge", cfg["bridge_extra_allowed_tools"])
 
     def test_cursor_bridge_config_updates_session_id_for_next_spawn(self):
         from tools.delegate_bridge_transport import ensure_cursor_bridge_config
@@ -1094,10 +1120,11 @@ class TestBlockedTools(unittest.TestCase):
             _get_max_spawn_depth, _get_orchestrator_enabled,
             _MIN_SPAWN_DEPTH, _MAX_SPAWN_DEPTH_CAP,
         )
-        self.assertEqual(_get_max_concurrent_children(), 3)
-        self.assertEqual(MAX_DEPTH, 1)
-        self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
-        self.assertTrue(_get_orchestrator_enabled())      # default
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            self.assertEqual(_get_max_concurrent_children(), 3)
+            self.assertEqual(MAX_DEPTH, 1)
+            self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
+            self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
         self.assertEqual(_MAX_SPAWN_DEPTH_CAP, 3)
 

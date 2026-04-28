@@ -52,6 +52,8 @@ class LeanCtxRuntimeConfig:
     include_symbols: bool = True
     include_callers: bool = True
     max_symbols: int = 3
+    expose_to_bridge_workers: bool = True
+    bridge_mcp_server_name: str = "lean-ctx"
 
 
 class LeanCtxClient:
@@ -288,6 +290,8 @@ def load_config_from_mapping(
         include_symbols=bool(raw.get("include_symbols", True)),
         include_callers=bool(raw.get("include_callers", True)),
         max_symbols=int(raw.get("max_symbols", 3)),
+        expose_to_bridge_workers=bool(raw.get("expose_to_bridge_workers", True)),
+        bridge_mcp_server_name=str(raw.get("bridge_mcp_server_name") or "lean-ctx"),
     )
 
 
@@ -311,6 +315,21 @@ def build_env(extra: dict[str, str] | None) -> dict[str, str]:
     if extra:
         env.update({key: value for key, value in extra.items() if key.startswith("LEAN_CTX_")})
     return env
+
+
+def bridge_mcp_server_config(config: LeanCtxRuntimeConfig) -> tuple[str, dict[str, Any]] | None:
+    if not config.enabled or not config.expose_to_bridge_workers:
+        return None
+    if not shutil.which(config.command):
+        return None
+    server: dict[str, Any] = {"command": config.command}
+    if config.args:
+        server["args"] = list(config.args)
+    if config.env:
+        env = {key: value for key, value in config.env.items() if key.startswith("LEAN_CTX_")}
+        if env:
+            server["env"] = env
+    return config.bridge_mcp_server_name, server
 
 
 def result_to_text(result: Any) -> str:
