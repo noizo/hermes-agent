@@ -68,7 +68,9 @@ from agent.usage_pricing import (
     format_duration_compact,
     format_token_count_compact,
 )
-from agent.account_usage import fetch_account_usage, render_account_usage_lines
+# NOTE: `from agent.account_usage import ...` is deliberately NOT at module
+# top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
+# needed when the user runs `/limits`. Lazy-imported inside the handler below.
 from hermes_cli.banner import _format_context_length, format_banner_version_label
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -1331,40 +1333,226 @@ def _skin_markdown_code_line_numbers() -> bool:
         return False
 
 
+_DIFF_HUNK_RE = re.compile(r"^@@ -(?P<old>\d+)(?:,(?P<old_count>\d+))? \+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@")
+
+
+def _diff_rows_with_real_line_numbers(lines: list[str]) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    old_line: int | None = None
+    new_line: int | None = None
+
+    for line in lines:
+        if line.startswith("@@"):
+            match = _DIFF_HUNK_RE.match(line)
+            if match:
+                old_line = int(match.group("old"))
+                new_line = int(match.group("new"))
+            rows.append(("", line, "hunk"))
+            continue
+
+        if old_line is None or new_line is None:
+            rows.append(("", line, "file"))
+            continue
+
+        if line.startswith("+") and not line.startswith("+++"):
+            rows.append((str(new_line), line, "add"))
+            new_line += 1
+            continue
+
+        if line.startswith("-") and not line.startswith("---"):
+            rows.append((str(old_line), line, "delete"))
+            old_line += 1
+            continue
+
+        if line.startswith(" "):
+            rows.append((str(new_line), line, "context"))
+            old_line += 1
+            new_line += 1
+            continue
+
+        rows.append(("", line, "meta"))
+
+    return rows
+
+
+def _guess_diff_lexer_from_path(path: str) -> str:
+    cleaned = path.strip()
+    if cleaned.startswith(("a/", "b/")):
+        cleaned = cleaned[2:]
+    if cleaned == "/dev/null":
+        return "text"
+    try:
+        from pygments.lexers import get_lexer_for_filename
+
+        aliases = getattr(get_lexer_for_filename(cleaned), "aliases", ())
+        if aliases:
+            return str(aliases[0])
+    except Exception:
+        pass
+
+    suffix = cleaned.rsplit(".", 1)[-1].lower() if "." in cleaned else ""
+    return {
+        "js": "javascript",
+        "jsx": "jsx",
+        "ts": "typescript",
+        "tsx": "tsx",
+        "py": "python",
+        "rb": "ruby",
+        "go": "go",
+        "rs": "rust",
+        "java": "java",
+        "kt": "kotlin",
+        "kts": "kotlin",
+        "sh": "bash",
+        "bash": "bash",
+        "zsh": "bash",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "json": "json",
+        "toml": "toml",
+        "md": "markdown",
+        "css": "css",
+        "scss": "scss",
+        "html": "html",
+        "xml": "xml",
+    }.get(suffix, "text")
+
+
+def _diff_lexer_from_header_line(line: str) -> str | None:
+    if not line.startswith("+++ "):
+        return None
+    path = line[4:].split("\t", 1)[0].strip()
+    return _guess_diff_lexer_from_path(path)
+
+
+def _highlight_diff_code_text(code: str, lexer: str, background: str | None):
+    from rich.syntax import Syntax
+    from rich.text import Text
+
+    if not code:
+        return Text("")
+    try:
+        highlighted = Syntax(
+            "",
+            lexer or "text",
+            theme=_skin_markdown_code_theme(),
+            background_color=background,
+        ).highlight(code)
+    except Exception:
+        highlighted = Syntax(
+            "",
+            "text",
+            theme=_skin_markdown_code_theme(),
+            background_color=background,
+        ).highlight(code)
+    if highlighted.plain.endswith("\n"):
+        highlighted = highlighted[:-1]
+    if highlighted:
+        highlighted.stylize("on default", 0, len(highlighted))
+    return highlighted
+
+
+def _compact_diff_renderable(lines: list[str]):
+    from rich.panel import Panel
+    from rich.text import Text
+
+    rows = _diff_rows_with_real_line_numbers(lines or [""])
+    number_width = max(3, *(len(number) for number, _, _ in rows))
+    base_style = "#E5E7EB"
+    number_style = "#94A3B8"
+    divider_style = f"{_accent_hex()} dim"
+    add_bg = "#1F6B3A"
+    delete_bg = "#8A3A45"
+    styles = {
+        "file": _accent_hex(),
+        "hunk": "#A7B6D8",
+        "add": f"#4ADE80 on {add_bg}",
+        "delete": f"#F87171 on {delete_bg}",
+        "context": base_style,
+        "meta": base_style,
+    }
+
+    current_lexer = "text"
+    rendered_rows: list[Text] = []
+    for number, content, kind in rows:
+        header_lexer = _diff_lexer_from_header_line(content)
+        if header_lexer:
+            current_lexer = header_lexer
+
+        row_style = styles.get(kind, base_style)
+        gutter_style = row_style if kind in {"add", "delete"} else number_style
+        rule_style = row_style if kind in {"add", "delete"} else divider_style
+        row = Text()
+        row.append(number.rjust(number_width) if number else " " * number_width, style=gutter_style)
+        row.append(" │ ", style=rule_style)
+
+        if kind in {"add", "delete", "context"} and content[:1] in {"+", "-", " "}:
+            marker = content[:1]
+            body = content[1:]
+            row_bg = add_bg if kind == "add" else delete_bg if kind == "delete" else None
+            marker_style = row_style if kind in {"add", "delete"} else base_style
+            row.append(marker, style=marker_style)
+            highlighted = _highlight_diff_code_text(body, current_lexer, None)
+            if kind in {"add", "delete"} and row_bg:
+                highlighted.stylize(f"on {row_bg}", 0, len(highlighted))
+            row.append_text(highlighted)
+        else:
+            row.append(content, style=row_style)
+        rendered_rows.append(row)
+
+    content_width = max((len(row.plain) for row in rendered_rows), default=0)
+    text = Text()
+    for idx, row in enumerate(rendered_rows):
+        if idx:
+            text.append("\n")
+        text.append_text(row)
+        kind = rows[idx][2]
+        if len(row.plain) < content_width:
+            pad_bg = add_bg if kind == "add" else delete_bg if kind == "delete" else None
+            if not pad_bg:
+                continue
+            text.append(" " * (content_width - len(row.plain)), style=f"on {pad_bg}")
+
+    return Panel(
+        text,
+        title="diff",
+        title_align="left",
+        border_style=f"{_accent_hex()} dim",
+        box=rich_box.ROUNDED,
+        expand=False,
+    )
+
+
 def _compact_code_renderable(language: str, lines: list[str]):
     from rich.panel import Panel
-    from rich.syntax import Syntax
+    from rich.text import Text
 
     code = "\n".join(lines or [""])
     lexer = (language or "text").strip() or "text"
+    if lexer in {"diff", "patch", "udiff"}:
+        return _compact_diff_renderable(lines)
+    line_numbers = _skin_markdown_code_line_numbers()
     if lexer in {"code", "raw"}:
         lexer = "text"
-    max_line_width = max((len(line) for line in code.splitlines()), default=1)
-    code_width = min(max(max_line_width + 2, 24), max(shutil.get_terminal_size((80, 24)).columns - 16, 24))
-    try:
-        syntax = Syntax(
-            code,
-            lexer,
-            theme=_skin_markdown_code_theme(),
-            background_color=_skin_markdown_code_background() or None,
-            line_numbers=_skin_markdown_code_line_numbers(),
-            padding=(0, 1),
-            code_width=code_width,
-            word_wrap=True,
-        )
-    except Exception:
-        syntax = Syntax(
-            code,
-            "text",
-            theme=_skin_markdown_code_theme(),
-            background_color=_skin_markdown_code_background() or None,
-            line_numbers=_skin_markdown_code_line_numbers(),
-            padding=(0, 1),
-            code_width=code_width,
-            word_wrap=True,
-        )
+        line_numbers = False
+    elif lexer == "text":
+        line_numbers = False
+
+    code_lines = code.splitlines() or [""]
+    number_width = max(2, len(str(len(code_lines))))
+    number_style = "#94A3B8"
+    divider_style = f"{_accent_hex()} dim"
+    text = Text()
+    for idx, line in enumerate(code_lines, start=1):
+        if idx > 1:
+            text.append("\n")
+        if line_numbers:
+            text.append(str(idx).rjust(number_width), style=number_style)
+            text.append(" │ ", style=divider_style)
+        text.append_text(_highlight_diff_code_text(line, lexer, None))
+
     return Panel(
-        syntax,
+        text,
         title=language or "code",
         title_align="left",
         border_style=f"{_accent_hex()} dim",
@@ -1374,15 +1562,139 @@ def _compact_code_renderable(language: str, lines: list[str]):
 
 
 _TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_EMOJI_SHORTCODES = {
+    "fire": "🔥",
+    "rocket": "🚀",
+    "rotating_light": "🚨",
+    "smile": "😄",
+    "tada": "🎉",
+    "warning": "⚠️",
+    "white_check_mark": "✅",
+}
+_SUBSCRIPT_TRANS = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+_SUPERSCRIPT_TRANS = str.maketrans("0123456789+-=()abcdefghijklmnopqrstuvwxyz", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖᑫʳˢᵗᵘᵛʷˣʸᶻ")
+
+
+def _translate_script_text(text: str, table: dict[int, str]) -> str:
+    return text.lower().translate(table)
+
+
+def _normalize_terminal_markdown_segment(segment: str) -> str:
+    segment = re.sub(
+        r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)",
+        lambda match: f"🖼 {match.group(1) or 'image'} — {match.group(2)}",
+        segment,
+    )
+    segment = re.sub(
+        r":([a-z][a-z0-9_+-]*):",
+        lambda match: _EMOJI_SHORTCODES.get(match.group(1), match.group(0)),
+        segment,
+    )
+    segment = re.sub(r"<kbd>(.*?)</kbd>", r"`\1`", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(r"<mark>(.*?)</mark>", r"\1", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(r"<ins>(.*?)</ins>", r"\1", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(
+        r"<sub>(.*?)</sub>",
+        lambda match: _translate_script_text(match.group(1), _SUBSCRIPT_TRANS),
+        segment,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    segment = re.sub(
+        r"<sup>(.*?)</sup>",
+        lambda match: _translate_script_text(match.group(1), _SUPERSCRIPT_TRANS),
+        segment,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    segment = re.sub(r"<small>(.*?)</small>", r"\1", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(r"<abbr\b[^>]*>(.*?)</abbr>", r"\1", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(r"<details>", "\n**Details:**\n", segment, flags=re.IGNORECASE)
+    segment = re.sub(r"</details>", "", segment, flags=re.IGNORECASE)
+    segment = re.sub(r"<summary>(.*?)</summary>", r"**Summary:** \1\n", segment, flags=re.IGNORECASE | re.DOTALL)
+    segment = re.sub(r"==([^=\n]+)==", r"\1", segment)
+    segment = re.sub(
+        r"(?<=\w)~([0-9A-Za-z+\-=()]+)~",
+        lambda match: _translate_script_text(match.group(1), _SUBSCRIPT_TRANS),
+        segment,
+    )
+    segment = re.sub(
+        r"\^([0-9A-Za-z+\-=()]+)\^",
+        lambda match: _translate_script_text(match.group(1), _SUPERSCRIPT_TRANS),
+        segment,
+    )
+    return segment
+
+
+def _normalize_terminal_markdown_text(text: str) -> str:
+    """Normalize terminal-only Markdown extensions while preserving code spans."""
+
+    parts = re.split(r"(`+[^`]*`+)", text)
+    return "".join(
+        part if part.startswith("`") and part.endswith("`") else _normalize_terminal_markdown_segment(part)
+        for part in parts
+    )
+
+
+def _normalize_terminal_markdown_block(text: str) -> str:
+    def nested_order_marker(number: int, level: int) -> str:
+        if level <= 1:
+            return f"{chr(ord('a') + max(number - 1, 0) % 26)}."
+        roman = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"]
+        return f"{roman[min(max(number, 1), len(roman)) - 1]}."
+
+    lines: list[str] = []
+    for line in _normalize_terminal_markdown_text(text).split("\n"):
+        task = re.match(r"^(\s*)[-+*]\s+\[([ xX])\]\s+(.*)$", line)
+        if task:
+            box = "☑" if task.group(2).lower() == "x" else "☐"
+            lines.append(f"{task.group(1)}{box} {task.group(3)}  ")
+            continue
+        nested_order = re.match(r"^(\s+)(\d+)[.)]\s+(.*)$", line)
+        if nested_order:
+            indent = nested_order.group(1)
+            level = max(1, len(indent.expandtabs(2)) // 3)
+            marker = nested_order_marker(int(nested_order.group(2)), level)
+            lines.append(f"{indent}{marker} {nested_order.group(3)}  ")
+            continue
+        alt_unordered = re.match(r"^(\s*)([*+])\s+(.*)$", line)
+        if alt_unordered:
+            marker = "◦" if alt_unordered.group(2) == "*" else "▪"
+            lines.append(f"{alt_unordered.group(1)}{marker} {alt_unordered.group(3)}  ")
+            continue
+        heading = re.match(r"^# (?!#)(.+)$", line)
+        if heading:
+            lines.append(f"## {heading.group(1)}")
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _split_markdown_table_row(line: str) -> list[str]:
     stripped = line.strip()
     if stripped.startswith("|"):
         stripped = stripped[1:]
-    if stripped.endswith("|"):
+    if stripped.endswith("|") and (len(stripped) == 1 or stripped[-2] != "\\"):
         stripped = stripped[:-1]
-    return [cell.strip() for cell in stripped.split("|")]
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    in_code = False
+    for char in stripped:
+        if char == "\\" and not escaped:
+            current.append(char)
+            escaped = True
+            continue
+        if char == "`" and not escaped:
+            in_code = not in_code
+            current.append(char)
+            continue
+        if char == "|" and not escaped and not in_code:
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+        escaped = False
+    cells.append("".join(current).strip())
+    return cells
 
 
 def _is_markdown_table_separator(line: str) -> bool:
@@ -1400,14 +1712,112 @@ def _is_markdown_table_start(lines: list[str], index: int) -> bool:
     return bool(headers) and len(headers) == len(separators) and _is_markdown_table_separator(lines[index + 1])
 
 
-def _markdown_table_renderable(table_lines: list[str]):
+def _markdown_table_code_style() -> str:
+    bg = _skin_markdown_code_background()
+    if bg:
+        return f"bold #E5E7EB on {bg}"
+    return "bold"
+
+
+def _combine_text_style(base: str, extra: str) -> str:
+    return " ".join(part for part in (base, extra) if part).strip()
+
+
+def _find_unescaped(text: str, marker: str, start: int) -> int:
+    idx = start
+    while True:
+        idx = text.find(marker, idx)
+        if idx < 0:
+            return -1
+        backslashes = 0
+        pos = idx - 1
+        while pos >= 0 and text[pos] == "\\":
+            backslashes += 1
+            pos -= 1
+        if backslashes % 2 == 0:
+            return idx
+        idx += len(marker)
+
+
+def _append_inline_markdown_text(out, text: str, style: str = "") -> None:
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            out.append(text[i + 1], style=style or None)
+            i += 2
+            continue
+
+        if text[i] == "`":
+            end = _find_unescaped(text, "`", i + 1)
+            if end > i:
+                out.append(text[i + 1:end], style=_markdown_table_code_style())
+                i = end + 1
+                continue
+
+        for marker, marker_style in (("**", "bold"), ("__", "bold"), ("~~", "strike")):
+            if text.startswith(marker, i):
+                end = _find_unescaped(text, marker, i + len(marker))
+                if end > i:
+                    _append_inline_markdown_text(
+                        out,
+                        text[i + len(marker):end],
+                        _combine_text_style(style, marker_style),
+                    )
+                    i = end + len(marker)
+                    break
+        else:
+            if text[i] == "*":
+                end = _find_unescaped(text, "*", i + 1)
+                if end > i:
+                    _append_inline_markdown_text(out, text[i + 1:end], _combine_text_style(style, "italic"))
+                    i = end + 1
+                    continue
+
+            if text[i] == "[":
+                close_label = _find_unescaped(text, "]", i + 1)
+                if close_label > i and close_label + 1 < len(text) and text[close_label + 1] == "(":
+                    close_url = _find_unescaped(text, ")", close_label + 2)
+                    if close_url > close_label:
+                        _append_inline_markdown_text(
+                            out,
+                            text[i + 1:close_label],
+                            _combine_text_style(style, f"underline {_accent_hex()}"),
+                        )
+                        i = close_url + 1
+                        continue
+
+            out.append(text[i], style=style or None)
+            i += 1
+            continue
+        continue
+
+
+def _markdown_table_cell_renderable(cell: str):
+    from rich.text import Text
+
+    text = Text()
+    _append_inline_markdown_text(text, _normalize_terminal_markdown_text(cell))
+    return text
+
+
+def _quote_renderable(renderable):
+    from rich.table import Table
+    from rich.text import Text
+
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(width=2)
+    grid.add_column()
+    grid.add_row(Text("│", style=f"{_accent_hex()} bold"), renderable)
+    return grid
+
+
+def _markdown_table_renderable(table_lines: list[str], *, quoted: bool = False):
     from rich.table import Table
 
     headers = _split_markdown_table_row(table_lines[0])
     separators = _split_markdown_table_row(table_lines[1])
     rows = [_split_markdown_table_row(line) for line in table_lines[2:] if "|" in line]
     table = Table(
-        *headers,
         box=rich_box.MARKDOWN,
         border_style=f"{_accent_hex()} dim",
         header_style=f"bold {_accent_hex()}",
@@ -1415,18 +1825,48 @@ def _markdown_table_renderable(table_lines: list[str]):
         show_edge=True,
         pad_edge=False,
     )
-    for idx, separator in enumerate(separators):
+    for header, separator in zip(headers, separators):
         clean = separator.replace(" ", "")
         if clean.startswith(":") and clean.endswith(":"):
-            table.columns[idx].justify = "center"
+            justify = "center"
         elif clean.endswith(":"):
-            table.columns[idx].justify = "right"
+            justify = "right"
         else:
-            table.columns[idx].justify = "left"
+            justify = "left"
+        table.add_column(header, justify=justify, overflow="fold")
     for row in rows:
         padded = row + [""] * (len(headers) - len(row))
-        table.add_row(*padded[: len(headers)])
-    return table
+        table.add_row(
+            *[_markdown_table_cell_renderable(cell) for cell in padded[: len(headers)]]
+        )
+    return _quote_renderable(table) if quoted else table
+
+
+def _strip_blockquote_prefix_with_depth(line: str) -> tuple[int, str]:
+    depth = 0
+    remaining = line
+    while True:
+        match = re.match(r"^[ \t]{0,3}>[ \t]?", remaining)
+        if not match:
+            return depth, remaining
+        depth += 1
+        remaining = remaining[match.end():]
+
+
+def _table_start_at(lines: list[str], index: int) -> tuple[int, list[str]] | None:
+    if index + 1 >= len(lines):
+        return None
+    depth, header = _strip_blockquote_prefix_with_depth(lines[index])
+    next_depth, separator = _strip_blockquote_prefix_with_depth(lines[index + 1])
+    if depth != next_depth:
+        return None
+    if "|" not in header or "|" not in separator:
+        return None
+    headers = _split_markdown_table_row(header)
+    separators = _split_markdown_table_row(separator)
+    if not (headers and len(headers) == len(separators) and _is_markdown_table_separator(separator)):
+        return None
+    return depth, [header, separator]
 
 
 def _append_markdown_or_tables(renderables: list, text: str) -> None:
@@ -1439,18 +1879,28 @@ def _append_markdown_or_tables(renderables: list, text: str) -> None:
     def flush_pending() -> None:
         nonlocal pending
         if pending and "\n".join(pending).strip():
-            renderables.append(Markdown("\n".join(pending), code_theme="default", inline_code_theme="default"))
+            renderables.append(
+                Markdown(
+                    _normalize_terminal_markdown_block("\n".join(pending)),
+                    code_theme="default",
+                    inline_code_theme="default",
+                )
+            )
         pending = []
 
     while i < len(lines):
-        if _is_markdown_table_start(lines, i):
+        table_start = _table_start_at(lines, i)
+        if table_start:
+            quote_depth, table_lines = table_start
             flush_pending()
-            table_lines = [lines[i], lines[i + 1]]
             i += 2
-            while i < len(lines) and "|" in lines[i] and lines[i].strip():
-                table_lines.append(lines[i])
+            while i < len(lines) and lines[i].strip():
+                row_depth, row = _strip_blockquote_prefix_with_depth(lines[i])
+                if row_depth != quote_depth or "|" not in row:
+                    break
+                table_lines.append(row)
                 i += 1
-            renderables.append(_markdown_table_renderable(table_lines))
+            renderables.append(_markdown_table_renderable(table_lines, quoted=quote_depth > 0))
             continue
         pending.append(lines[i])
         i += 1
@@ -1495,13 +1945,13 @@ def _strip_blockquote_prefix(line: str) -> str:
 def _compact_fence_match(line: str):
     match = _FENCE_OPEN_RE.match(line)
     if match:
-        return match, False
-    quoted = _strip_blockquote_prefix(line)
-    if quoted != line:
+        return match, 0
+    depth, quoted = _strip_blockquote_prefix_with_depth(line)
+    if depth:
         match = _FENCE_OPEN_RE.match(quoted)
         if match:
-            return match, True
-    return None, False
+            return match, depth
+    return None, 0
 
 
 def _render_compact_markdown_content(text: str):
@@ -1521,7 +1971,7 @@ def _render_compact_markdown_content(text: str):
 
     while i < len(lines):
         line = lines[i]
-        match, quoted_fence = _compact_fence_match(line)
+        match, quote_depth = _compact_fence_match(line)
         if match:
             flush_pending()
             fence = match.group("fence")
@@ -1532,13 +1982,14 @@ def _render_compact_markdown_content(text: str):
             block: list[str] = []
             close_re = re.compile(rf"^{re.escape(indent)}{re.escape(fence)}[ \t]*$")
             while i < len(lines):
-                code_line = _strip_blockquote_prefix(lines[i]) if quoted_fence else lines[i]
+                code_line = _strip_blockquote_prefix(lines[i]) if quote_depth else lines[i]
                 if close_re.match(code_line):
                     i += 1
                     break
                 block.append(code_line)
                 i += 1
-            renderables.append(_compact_code_renderable(language, block or [""]))
+            code_renderable = _compact_code_renderable(language, block or [""])
+            renderables.append(_quote_renderable(code_renderable) if quote_depth else code_renderable)
             continue
         pending.append(line)
         i += 1
@@ -5927,6 +6378,8 @@ class HermesCLI:
             try:
                 providers = list_authenticated_providers(
                     current_provider=self.provider or "",
+                    current_base_url=self.base_url or "",
+                    current_model=self.model or "",
                     user_providers=user_provs,
                     custom_providers=custom_provs,
                     max_models=50,
@@ -6704,6 +7157,8 @@ class HermesCLI:
             self._console_print(f"  Status bar {state}")
         elif canonical == "verbose":
             self._toggle_verbose()
+        elif canonical == "footer":
+            self._handle_footer_command(cmd_original)
         elif canonical == "yolo":
             self._toggle_yolo()
         elif canonical == "reasoning":
@@ -7328,6 +7783,58 @@ class HermesCLI:
         if self._apply_tui_skin_style():
             print("  Prompt + TUI colors updated.")
 
+    def _handle_footer_command(self, cmd_original: str) -> None:
+        """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.
+
+        Usage:
+            /footer           → toggle
+            /footer on|off    → explicit
+            /footer status    → show current state
+        """
+        from hermes_cli.config import load_config
+        from hermes_cli.colors import Colors as _Colors
+
+        # Parse arg
+        arg = ""
+        try:
+            parts = (cmd_original or "").strip().split(None, 1)
+            if len(parts) > 1:
+                arg = parts[1].strip().lower()
+        except Exception:
+            arg = ""
+
+        cfg = load_config() or {}
+        footer_cfg = ((cfg.get("display") or {}).get("runtime_footer") or {})
+        current = bool(footer_cfg.get("enabled", False))
+        fields = footer_cfg.get("fields") or ["model", "context_pct", "cwd"]
+
+        if arg in ("status", "?"):
+            state = "ON" if current else "OFF"
+            _cprint(
+                f"  {_Colors.BOLD}Runtime footer:{_Colors.RESET} {state}\n"
+                f"  Fields: {', '.join(fields)}"
+            )
+            return
+
+        if arg in ("on", "enable", "true", "1"):
+            new_state = True
+        elif arg in ("off", "disable", "false", "0"):
+            new_state = False
+        elif arg == "":
+            new_state = not current
+        else:
+            _cprint("  Usage: /footer [on|off|status]")
+            return
+
+        if save_config_value("display.runtime_footer.enabled", new_state):
+            state = (
+                f"{_Colors.GREEN}ON{_Colors.RESET}" if new_state
+                else f"{_Colors.DIM}OFF{_Colors.RESET}"
+            )
+            _cprint(f"  Runtime footer: {state}")
+        else:
+            _cprint("  Failed to save runtime_footer setting to config.yaml")
+
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off."""
         cycle = ["off", "new", "all", "verbose"]
@@ -7568,9 +8075,15 @@ class HermesCLI:
                 else:
                     print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
+                # Pass None as system_message so _compress_context rebuilds
+                # the system prompt from scratch via _build_system_prompt(None).
+                # Passing _cached_system_prompt caused duplication because
+                # _build_system_prompt appends system_message to prompt_parts
+                # which already contain the agent identity — resulting in the
+                # identity block appearing twice (issue #15281).
                 compressed, _ = self.agent._compress_context(
                     original_history,
-                    self.agent._cached_system_prompt or "",
+                    None,
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                 )
@@ -7694,6 +8207,8 @@ class HermesCLI:
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
         base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
         api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
+        # Lazy import — pulls the OpenAI SDK chain, only needed here.
+        from agent.account_usage import fetch_account_usage, render_account_usage_lines
         account_snapshot = None
         if provider:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
