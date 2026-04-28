@@ -1468,19 +1468,19 @@ delegation:
                                             # delegate_task keeps embedded API behavior unless a
                                             # call explicitly supplies persona_provider/acp_command.
   # persona_workdir: "~/code/project"       # Optional default workdir for persona-backed bridge workers
-  # bridge_extra_mcp_servers:               # Extra MCPs for Claude bridge workers only
-  #   hindsight-prv:
+  # bridge_extra_mcp_servers:               # Extra MCPs for bridge workers
+  #   hindsight-memory:                     # Example: Hindsight or another memory MCP
   #     type: http
-  #     url: "http://localhost:8888/mcp/prv/"
+  #     url: "https://memory.example.com/mcp/"
   # bridge_extra_allowed_tools:
-  #   - "mcp__hindsight-prv__recall"
+  #   - "mcp__hindsight-memory__recall"
 ```
 
 **Transport selection:** `delegation.default_transport: "auto"` prefers `bridge` for bridge-capable Claude/Cursor personas or commands. Use `embedded-api` for native API-key child agents, `simple-pipe` only for legacy one-shot CLI compatibility, and `experimental-oauth` only for explicit local proxy/OAuth experiments.
 
 **Bridge personas:** `persona`, `persona_provider`, `persona_model`, and `persona_workdir` route a delegated child to a named local Claude Code or Cursor Agent persona without changing the parent `SOUL.md` or `/personality`. `persona_provider` uses canonical names only: `claude` or `cursor-agent`. If omitted, Hermes uses `delegation.persona_provider` when configured; if neither is set, plain delegation keeps embedded API behavior. Bridge workers own their local CLI auth; Hermes does not inspect, copy, refresh, migrate, or inject OAuth tokens.
 
-**Worker MCPs:** Claude bridge workers receive a strict generated MCP config. Add shared worker memory MCPs with `bridge_extra_mcp_servers` and expose only the needed tools with `bridge_extra_allowed_tools`. Cursor bridge workers use workspace/global Cursor MCP config plus `--approve-mcps`; they do not use Claude Code's `--mcp-config` flags.
+**Worker MCPs:** Claude bridge workers receive a strict generated MCP config. Add shared worker memory MCPs with `bridge_extra_mcp_servers` and expose only the needed Claude tools with `bridge_extra_allowed_tools`. Cursor bridge workers use project Cursor MCP config plus `--approve-mcps`; Hermes writes `worker-bridge` and merges configured `bridge_extra_mcp_servers` into `.cursor/mcp.json`, but Cursor does not use Claude Code's `--mcp-config` or `--allowedTools` flags.
 
 **Embedded provider:model override:** By default, embedded API subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route embedded API subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 

@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
+    DELEGATE_DELEGATION_INFO_SCHEMA,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
     _get_max_concurrent_children,
@@ -83,6 +84,7 @@ class TestDelegateRequirements(unittest.TestCase):
 
         expected = {
             "delegate_list_personas",
+            "delegate_delegation_info",
             "delegate_bridge_check",
             "delegate_bridge_reply",
             "delegate_bridge_result",
@@ -174,6 +176,36 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertIn("other", data["mcpServers"])
             self.assertIn("worker-bridge", data["mcpServers"])
 
+    def test_cursor_bridge_config_merges_configured_extra_mcp_servers(self):
+        from tools.delegate_bridge_transport import ensure_cursor_bridge_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "repo"
+            cwd.mkdir()
+            root = Path(tmp) / "cache"
+            bridge_server = Path(tmp) / "bridge-mcp" / "server.js"
+            bridge_server.parent.mkdir()
+            bridge_server.write_text("// test\n")
+            cfg = {
+                "bridge_extra_mcp_servers": {
+                    "shared-memory": {
+                        "type": "http",
+                        "url": "https://memory.example.com/mcp/",
+                    },
+                    "lean-ctx": {
+                        "command": "lean-ctx",
+                        "args": ["mcp"],
+                    },
+                }
+            }
+
+            ensure_cursor_bridge_config(cwd, root, bridge_server, "hermes-test", cfg)
+
+            servers = json.loads((cwd / ".cursor" / "mcp.json").read_text())["mcpServers"]
+            self.assertIn("worker-bridge", servers)
+            self.assertEqual(servers["shared-memory"]["url"], "https://memory.example.com/mcp/")
+            self.assertEqual(servers["lean-ctx"]["command"], "lean-ctx")
+
     def test_cursor_bridge_config_updates_session_id_for_next_spawn(self):
         from tools.delegate_bridge_transport import ensure_cursor_bridge_config
 
@@ -202,9 +234,9 @@ class TestBridgeTransportConfig(unittest.TestCase):
             bridge_server = Path(tmp) / "bridge-mcp" / "server.js"
             cfg = {
                 "bridge_extra_mcp_servers": {
-                    "hindsight-prv": {
+                    "shared-memory": {
                         "type": "http",
-                        "url": "http://localhost:8888/mcp/prv/",
+                        "url": "https://memory.example.com/mcp/",
                     }
                 }
             }
@@ -218,8 +250,8 @@ class TestBridgeTransportConfig(unittest.TestCase):
             )
 
             servers = json.loads(config_path.read_text())["mcpServers"]
-            self.assertEqual(set(servers), {"worker-bridge", "hindsight-prv"})
-            self.assertEqual(servers["hindsight-prv"]["url"], "http://localhost:8888/mcp/prv/")
+            self.assertEqual(set(servers), {"worker-bridge", "shared-memory"})
+            self.assertEqual(servers["shared-memory"]["url"], "https://memory.example.com/mcp/")
 
     def test_claude_bridge_allows_configured_extra_mcp_tools(self):
         from tools.delegate_bridge_transport import _build_worker_command
@@ -229,8 +261,8 @@ class TestBridgeTransportConfig(unittest.TestCase):
             session_dir.mkdir()
             cfg = {
                 "bridge_extra_allowed_tools": [
-                    "mcp__hindsight-prv__recall",
-                    "mcp__hindsight-prv__reflect",
+                    "mcp__shared-memory__recall",
+                    "mcp__shared-memory__reflect",
                 ]
             }
 
@@ -250,8 +282,8 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertEqual(command, "claude")
             allowed = args[args.index("--allowedTools") + 1]
             self.assertIn("mcp__worker-bridge__report_to_orchestrator", allowed)
-            self.assertIn("mcp__hindsight-prv__recall", allowed)
-            self.assertIn("mcp__hindsight-prv__reflect", allowed)
+            self.assertIn("mcp__shared-memory__recall", allowed)
+            self.assertIn("mcp__shared-memory__reflect", allowed)
 
     def test_cursor_bridge_uses_workspace_mcp_config_not_claude_flags(self):
         from tools.delegate_bridge_transport import _build_worker_command
@@ -277,6 +309,37 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertNotIn("--mcp-config", args)
             self.assertNotIn("--strict-mcp-config", args)
             self.assertNotIn("--allowedTools", args)
+
+    def test_bridge_preamble_includes_runtime_context_without_skill_docs(self):
+        from tools.delegate_bridge_transport import _bridge_preamble
+
+        prompt = _bridge_preamble(
+            "claude",
+            {
+                "parent_runtime": {"source_root": "/tmp/hermes", "branch": "feature"},
+                "bridge": {
+                    "session_id": "hermes-test",
+                    "extra_mcp_server_names": ["shared-memory"],
+                    "extra_allowed_tools": ["mcp__shared-memory__recall"],
+                },
+            },
+        )
+
+        self.assertIn("HERMES_RUNTIME_CONTEXT", prompt)
+        self.assertIn("hermes-test", prompt)
+        self.assertIn("shared-memory", prompt)
+
+    def test_delegation_info_schema_is_native_tool_surface(self):
+        self.assertEqual(DELEGATE_DELEGATION_INFO_SCHEMA["name"], "delegate_delegation_info")
+
+    def test_bridge_server_default_path_is_packaged(self):
+        from tools.delegate_bridge_transport import _bridge_server_path
+
+        bridge_server = _bridge_server_path({})
+
+        self.assertEqual(bridge_server.name, "bridge_mcp_server.js")
+        self.assertTrue(bridge_server.exists())
+        self.assertEqual(bridge_server.parent.name, "tools")
 
     def test_bridge_status_reports_starting_before_ipc_dir_exists(self):
         from tools.delegate_bridge_transport import bridge_status

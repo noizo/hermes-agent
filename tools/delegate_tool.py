@@ -34,6 +34,7 @@ from tools import file_state
 from tools.delegate_bridge_transport import (
     SUPPORTED_BRIDGE_COMMANDS,
     bridge_result,
+    bridge_runtime_info,
     bridge_status,
     reply_bridge_session,
     spawn_bridge_session,
@@ -2807,7 +2808,12 @@ DELEGATE_TASK_SCHEMA = {
         "(default 2) and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
-        "- Results are always returned as an array, one entry per task."
+        "- Results are always returned as an array, one entry per task.\n"
+        "- For Claude/Cursor bridge workers, use delegate_list_personas before choosing "
+        "a persona and delegate_delegation_info when you need native bridge/MCP wiring facts. "
+        "Bridge workers report back through delegate_bridge_check/reply/result/kill. "
+        "Claude receives a per-session MCP config and allowed-tools list; Cursor uses "
+        "project Cursor MCP config plus --approve-mcps."
     ),
     "parameters": {
         "type": "object",
@@ -3107,6 +3113,52 @@ DELEGATE_BRIDGE_KILL_SCHEMA = {
         "required": ["session_id"],
     },
 }
+
+
+DELEGATE_DELEGATION_INFO_SCHEMA = {
+    "name": "delegate_delegation_info",
+    "description": (
+        "Return native delegation capabilities and bridge/MCP wiring facts so agents "
+        "do not need a separate skill to know how Claude/Cursor subagents are configured."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def _delegate_delegation_info_handler(args, **kwargs) -> str:
+    cfg = _load_config()
+    return json.dumps(
+        {
+            "default_transport": cfg.get("default_transport") or "auto",
+            "persona_provider": cfg.get("persona_provider"),
+            "persona_dirs": cfg.get("persona_dirs") or {},
+            "max_concurrent_children": _get_max_concurrent_children(),
+            "max_spawn_depth": _get_max_spawn_depth(),
+            "orchestrator_enabled": cfg.get("orchestrator_enabled", True),
+            "bridge": bridge_runtime_info(cfg),
+            "follow_up_tools": [
+                "delegate_bridge_check",
+                "delegate_bridge_reply",
+                "delegate_bridge_result",
+                "delegate_bridge_kill",
+            ],
+            "persona_tools": ["delegate_list_personas"],
+        }
+    )
+
+
+registry.register(
+    name="delegate_delegation_info",
+    toolset="delegation",
+    schema=DELEGATE_DELEGATION_INFO_SCHEMA,
+    handler=_delegate_delegation_info_handler,
+    check_fn=check_delegate_requirements,
+    emoji="🔀",
+)
 
 
 registry.register(

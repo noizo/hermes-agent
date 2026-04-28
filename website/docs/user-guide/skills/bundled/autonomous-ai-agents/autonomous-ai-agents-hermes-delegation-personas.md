@@ -93,19 +93,19 @@ through the parent provider, a custom endpoint, or another configured provider.
 ## MCP Wiring
 
 Claude bridge workers use a strict generated MCP config. Add extra worker MCPs
-with `delegation.bridge_extra_mcp_servers` and allow only the required tools with
-`delegation.bridge_extra_allowed_tools`.
+with `delegation.bridge_extra_mcp_servers` and allow only the required Claude
+tools with `delegation.bridge_extra_allowed_tools`.
 
-Cursor Agent bridge workers use workspace/global Cursor MCP configuration plus
-`--approve-mcps`. Cursor does not use Claude Code flags such as `--mcp-config`,
-`--strict-mcp-config`, or `--allowedTools`.
+Cursor Agent bridge workers use project Cursor MCP configuration plus
+`--approve-mcps`. Hermes writes `worker-bridge` and merges configured
+`bridge_extra_mcp_servers` into `.cursor/mcp.json`. Cursor does not use Claude
+Code flags such as `--mcp-config`, `--strict-mcp-config`, or `--allowedTools`.
 
 ## Memory Split
 
-Hermes parent memory may use a native memory provider such as Hindsight.
-Bridge workers need explicit MCP access if they should read/write shared memory.
-Do not assume parent native memory tools are automatically available inside
-Claude/Cursor child CLIs.
+Hermes parent memory may use native memory providers. Bridge workers need
+explicit MCP access if they should read/write shared memory. Do not assume parent
+native memory tools are automatically available inside Claude/Cursor child CLIs.
 
 ## Recommended Calls
 

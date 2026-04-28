@@ -17,6 +17,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -73,7 +74,7 @@ def _bridge_server_path(cfg: dict[str, Any] | None = None) -> Path:
     )
     if configured:
         return Path(str(configured)).expanduser()
-    return _home() / "git" / "prv" / "orchestrate-cursor-agent-mcp" / "src" / "bridge-mcp" / "server.js"
+    return Path(__file__).with_name("bridge_mcp_server.js")
 
 
 def _allowed_roots(cfg: dict[str, Any] | None = None) -> list[Path]:
@@ -200,6 +201,37 @@ def _bridge_extra_allowed_tools(cfg: dict[str, Any] | None = None) -> list[str]:
     return [str(tool) for tool in raw if str(tool).strip()]
 
 
+def bridge_runtime_info(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return non-secret bridge/delegation runtime facts for agents."""
+
+    root = _bridge_root(cfg)
+    bridge_server = _bridge_server_path(cfg)
+    extra_server_names = sorted(_bridge_extra_mcp_servers(cfg))
+    return {
+        "supported_worker_commands": sorted(SUPPORTED_BRIDGE_COMMANDS),
+        "bridge_root": str(root),
+        "bridge_server_path": str(bridge_server),
+        "bridge_server_exists": bridge_server.exists(),
+        "allowed_roots": [str(path) for path in _allowed_roots(cfg)],
+        "extra_mcp_server_names": extra_server_names,
+        "extra_allowed_tools": _bridge_extra_allowed_tools(cfg),
+        "claude": {
+            "mcp_config": "per-session worker-bridge.mcp.json",
+            "strict_mcp_config": True,
+            "allowed_tools": [
+                "mcp__worker-bridge__report_to_orchestrator",
+                *_bridge_extra_allowed_tools(cfg),
+            ],
+        },
+        "cursor_agent": {
+            "mcp_config": "project .cursor/mcp.json",
+            "approve_mcps": True,
+            "auto_config_worker_bridge": (cfg or {}).get("cursor_bridge_auto_config") is not False,
+            "extra_mcp_servers_merged": True,
+        },
+    }
+
+
 def _write_claude_mcp_config(
     session_dir: Path,
     root: Path,
@@ -305,23 +337,84 @@ def ensure_cursor_bridge_config(
     }
     if existing != desired:
         servers["worker-bridge"] = desired
+
+    changed = existing != desired
+    for name, server in _bridge_extra_mcp_servers(cfg).items():
+        if servers.get(name) != server:
+            servers[name] = server
+            changed = True
+
+    if changed:
         config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     return config_path
 
 
-def _bridge_preamble(worker_type: str) -> str:
-    return "\n".join(
-        [
-            "ORCHESTRATION MODE: You are a worker agent supervised by Hermes.",
-            "Communicate with the parent ONLY through the report_to_orchestrator MCP tool.",
-            "Your first action must call report_to_orchestrator with a one-line acknowledgement and plan.",
-            "Call report_to_orchestrator for clarifying questions, progress, final results, or blockers.",
-            "Keep bridge messages concise. Do not inspect secrets or tokens.",
-            "Stop only when the task is complete and reported, the parent says stop/done, or you hit a fatal error.",
-            f"WORKER TYPE: {worker_type}",
-        ]
-    )
+def _git_metadata(root: Path) -> dict[str, str | None]:
+    def run_git(*args: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=2,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        return (proc.stdout or "").strip() or None
+
+    return {
+        "branch": run_git("branch", "--show-current"),
+        "commit": run_git("rev-parse", "--short", "HEAD"),
+    }
+
+
+def _build_runtime_metadata(
+    *,
+    worker_type: str,
+    session_id: str,
+    cwd: Path,
+    cfg: dict[str, Any] | None,
+) -> dict[str, Any]:
+    source_root = Path(__file__).resolve().parents[1]
+    return {
+        "parent_runtime": {
+            "python_executable": sys.executable,
+            "source_root": str(source_root),
+            **_git_metadata(source_root),
+        },
+        "bridge": {
+            "session_id": session_id,
+            "worker_type": worker_type,
+            "cwd": str(cwd),
+            "mcp_wiring": (
+                "claude uses per-session worker-bridge.mcp.json with --strict-mcp-config and --allowedTools"
+                if worker_type == "claude"
+                else "cursor-agent uses project .cursor/mcp.json plus --approve-mcps"
+            ),
+            "extra_mcp_server_names": sorted(_bridge_extra_mcp_servers(cfg)),
+            "extra_allowed_tools": _bridge_extra_allowed_tools(cfg),
+        },
+    }
+
+
+def _bridge_preamble(worker_type: str, runtime_metadata: dict[str, Any] | None = None) -> str:
+    parts = [
+        "ORCHESTRATION MODE: You are a worker agent supervised by Hermes.",
+        "Communicate with the parent ONLY through the report_to_orchestrator MCP tool.",
+        "Your first action must call report_to_orchestrator with a one-line acknowledgement and plan.",
+        "Call report_to_orchestrator for clarifying questions, progress, final results, or blockers.",
+        "Keep bridge messages concise. Do not inspect secrets or tokens.",
+        "Stop only when the task is complete and reported, the parent says stop/done, or you hit a fatal error.",
+        f"WORKER TYPE: {worker_type}",
+    ]
+    if runtime_metadata:
+        metadata = redact_sensitive_text(json.dumps(runtime_metadata, indent=2, sort_keys=True))
+        parts.extend(["", "HERMES_RUNTIME_CONTEXT:", metadata])
+    return "\n".join(parts)
 
 
 def _build_worker_command(
@@ -508,7 +601,8 @@ def spawn_bridge_session(
 
     model = _extract_model(acp_args)
     task_text = goal if not context else f"{goal}\n\nCONTEXT:\n{context}"
-    prompt = _bridge_preamble(worker_type) + "\n\nTASK:\n" + task_text
+    runtime_metadata = _build_runtime_metadata(worker_type=worker_type, session_id=sid, cwd=cwd, cfg=cfg)
+    prompt = _bridge_preamble(worker_type, runtime_metadata) + "\n\nTASK:\n" + task_text
     command, args = _build_worker_command(
         worker_type=worker_type,
         model=model,
