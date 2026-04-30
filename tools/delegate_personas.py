@@ -38,8 +38,38 @@ DEFAULT_ROUTING: dict[str, Any] = {
     },
     "tiers": [
         {
+            "name": "review",
+            "patterns": [
+                "review",
+                "reviewer",
+                "code-reviewer",
+                "security-reviewer",
+                "wp-reviewer",
+                "architect-reviewer",
+                "research-reviewer",
+                "verifier",
+                "auditor",
+                "audit",
+            ],
+            "provider": "claude",
+            "models": {
+                "claude": "opus",
+                "cursor-agent": "gpt-5.5-extra-high",
+            },
+        },
+        {
+            "name": "code",
+            "patterns": ["implementer", "coder", "engineer", "developer", "refactor", "fixer", "quick-fix"],
+            "provider": "cursor-agent",
+            "models": {
+                "claude": "opus",
+                "cursor-agent": "gpt-5.5-extra-high",
+            },
+        },
+        {
             "name": "deep-design",
             "patterns": ["architect", "design-architect", "planner", "design-system"],
+            "provider": "claude",
             "models": {
                 "claude": "opus",
                 "cursor-agent": "claude-opus-4-7-thinking-xhigh",
@@ -48,22 +78,16 @@ DEFAULT_ROUTING: dict[str, Any] = {
         {
             "name": "research",
             "patterns": ["researcher", "research-reviewer", "deep-research"],
+            "provider": "claude",
             "models": {
                 "claude": "opus",
                 "cursor-agent": "claude-opus-4-7-thinking-xhigh",
             },
         },
         {
-            "name": "code",
-            "patterns": ["implementer", "code-reviewer", "coder", "engineer", "developer", "refactor"],
-            "models": {
-                "claude": "opus",
-                "cursor-agent": "gpt-5.5-extra-high",
-            },
-        },
-        {
             "name": "quick-verify",
-            "patterns": ["verifier", "debugger", "fixer", "quick-fix", "tester", "test"],
+            "patterns": ["debugger", "tester", "test"],
+            "provider": "claude",
             "models": {
                 "claude": "opus",
                 "cursor-agent": "gpt-5.5-extra-high",
@@ -314,6 +338,22 @@ def persona_can_write(name: str) -> bool:
     return any(_contains_name_pattern(name, pattern) for pattern in WRITE_PERSONA_PATTERNS)
 
 
+def _resolve_provider(persona_name: str, cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    routing = _routing(cfg)
+    tiers = routing.get("tiers", []) or []
+    name_lower = persona_name.lower()
+    for tier in tiers:
+        for pattern in tier.get("patterns", []):
+            if _contains_name_pattern(name_lower, str(pattern)):
+                provider = str(tier.get("provider") or "").strip()
+                if provider in CANONICAL_PERSONA_PROVIDERS:
+                    return {
+                        "provider": provider,
+                        "reason": f"tier '{tier.get('name', '?')}' matched pattern '{pattern}'",
+                    }
+    return {"provider": "", "reason": "no provider tier matched"}
+
+
 def _resolve_model(
     provider: str,
     persona_name: str,
@@ -410,9 +450,16 @@ def list_delegate_persona_models(
     return result
 
 
-def _build_acp_args(provider: str, model: str, workdir: str, persona_name: str) -> list[str]:
+def _build_acp_args(
+    provider: str,
+    model: str,
+    workdir: str,
+    persona_name: str,
+    *,
+    unsafe_allow_writes: bool | None = None,
+) -> list[str]:
     args = list(PROVIDER_BASE_ARGS.get(provider, ["-p"]))
-    can_write = persona_can_write(persona_name)
+    can_write = persona_can_write(persona_name) if unsafe_allow_writes is None else bool(unsafe_allow_writes)
     if provider == "claude":
         if model:
             args += ["--model", model]
@@ -463,6 +510,7 @@ def apply_persona_to_task(
     top_level_transport: str | None = None,
     top_level_acp_command: str | None = None,
     top_level_acp_args: list[str] | None = None,
+    top_level_unsafe_allow_writes: bool = False,
 ) -> dict[str, Any]:
     """Return a copy of *task* with persona-derived delegation fields filled.
 
@@ -478,18 +526,25 @@ def apply_persona_to_task(
     if not persona:
         raise ValueError(f"delegation persona not found: {persona_name}")
 
+    transport_value = str(task.get("transport") or top_level_transport or "").strip()
+    explicit_provider_value = task.get("persona_provider") or top_level_provider
+    if (
+        transport_value in {"embedded-api", "embedded_api", "embedded", "api"}
+        and not explicit_provider_value
+        and not top_level_acp_command
+    ):
+        return dict(task)
+
     command_base = os.path.basename(str(top_level_acp_command or "")).lower()
     command_provider = command_base if command_base in CANONICAL_PERSONA_PROVIDERS else None
+    routed_provider = _resolve_provider(persona["name"], cfg)
     provider_value = (
-        task.get("persona_provider")
-        or top_level_provider
+        explicit_provider_value
         or command_provider
+        or routed_provider["provider"]
         or (cfg or {}).get("persona_provider")
     )
     if not provider_value:
-        transport_value = str(task.get("transport") or top_level_transport or "").strip()
-        if transport_value in {"embedded-api", "embedded_api", "embedded", "api"}:
-            return dict(task)
         raise ValueError(
             "delegation persona requires canonical persona_provider 'claude' "
             "or 'cursor-agent' (per task, top-level call, acp_command, or "
@@ -514,18 +569,39 @@ def apply_persona_to_task(
         compress=compress,
     )
 
+    if "unsafe_allow_writes" in task:
+        effective_unsafe_allow_writes = bool(task.get("unsafe_allow_writes"))
+    else:
+        effective_unsafe_allow_writes = bool(top_level_unsafe_allow_writes) or persona_can_write(persona["name"])
+
     enriched = dict(task)
     enriched["context"] = context
     if not top_level_acp_command:
         enriched.setdefault("acp_command", provider)
     if not top_level_acp_args:
-        enriched.setdefault("acp_args", _build_acp_args(provider, model, workdir, persona["name"]))
+        enriched.setdefault(
+            "acp_args",
+            _build_acp_args(
+                provider,
+                model,
+                workdir,
+                persona["name"],
+                unsafe_allow_writes=effective_unsafe_allow_writes,
+            ),
+        )
     enriched.setdefault("transport", top_level_transport or "bridge")
-    enriched.setdefault("unsafe_allow_writes", persona_can_write(persona["name"]))
+    enriched["unsafe_allow_writes"] = effective_unsafe_allow_writes
     enriched["_persona_meta"] = {
         "persona": persona["name"],
         "pool": persona["pool"],
         "provider": provider,
+        "provider_resolved_via": (
+            "explicit override"
+            if task.get("persona_provider") or top_level_provider or command_provider
+            else routed_provider["reason"]
+            if routed_provider["provider"]
+            else "delegation.persona_provider"
+        ),
         "model": model,
         "model_resolved_via": resolved["reason"],
         "workdir": workdir,

@@ -14,6 +14,19 @@ from typing import Any, Callable
 
 _DEFAULT_COMMAND = "lean-ctx"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_BRIDGE_SAFE_TOOL_NAMES = (
+    "ctx_read",
+    "ctx_multi_read",
+    "ctx_smart_read",
+    "ctx_delta",
+    "ctx_search",
+    "ctx_tree",
+    "ctx_shell",
+    "ctx_symbol",
+    "ctx_callers",
+    "ctx_gain",
+    "ctx_cost",
+)
 _SAFE_ENV_KEYS = {
     "PATH",
     "HOME",
@@ -54,6 +67,7 @@ class LeanCtxRuntimeConfig:
     max_symbols: int = 3
     expose_to_bridge_workers: bool = True
     bridge_mcp_server_name: str = "lean-ctx"
+    bridge_safe_tools: tuple[str, ...] = DEFAULT_BRIDGE_SAFE_TOOL_NAMES
 
 
 class LeanCtxClient:
@@ -292,7 +306,21 @@ def load_config_from_mapping(
         max_symbols=int(raw.get("max_symbols", 3)),
         expose_to_bridge_workers=bool(raw.get("expose_to_bridge_workers", True)),
         bridge_mcp_server_name=str(raw.get("bridge_mcp_server_name") or "lean-ctx"),
+        bridge_safe_tools=_parse_bridge_safe_tools(raw.get("bridge_safe_tools")),
     )
+
+
+def _parse_bridge_safe_tools(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return DEFAULT_BRIDGE_SAFE_TOOL_NAMES
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, list):
+        items = [str(part).strip() for part in raw]
+    else:
+        return DEFAULT_BRIDGE_SAFE_TOOL_NAMES
+    safe = [tool for tool in items if tool in DEFAULT_BRIDGE_SAFE_TOOL_NAMES]
+    return tuple(dict.fromkeys(safe)) or DEFAULT_BRIDGE_SAFE_TOOL_NAMES
 
 
 def raw_lean_ctx_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -322,14 +350,24 @@ def bridge_mcp_server_config(config: LeanCtxRuntimeConfig) -> tuple[str, dict[st
         return None
     if not shutil.which(config.command):
         return None
-    server: dict[str, Any] = {"command": config.command}
+    wrapper = Path(__file__).with_name("lean_ctx_bridge_mcp_server.js")
+    if not wrapper.exists():
+        return None
+    env = {
+        "LEAN_CTX_COMMAND": config.command,
+        "LEAN_CTX_BRIDGE_SAFE_TOOLS": ",".join(config.bridge_safe_tools),
+        "LEAN_CTX_BRIDGE_TIMEOUT_MS": str(int(config.packet_timeout_seconds * 1000)),
+        "LEAN_CTX_BRIDGE_MAX_CHARS": str(config.delegation_max_chars),
+    }
     if config.args:
-        server["args"] = list(config.args)
+        env["LEAN_CTX_ARGS"] = json.dumps(list(config.args))
     if config.env:
-        env = {key: value for key, value in config.env.items() if key.startswith("LEAN_CTX_")}
-        if env:
-            server["env"] = env
-    return config.bridge_mcp_server_name, server
+        env.update({key: value for key, value in config.env.items() if key.startswith("LEAN_CTX_")})
+    return config.bridge_mcp_server_name, {
+        "command": shutil.which("node") or "node",
+        "args": [str(wrapper)],
+        "env": env,
+    }
 
 
 def result_to_text(result: Any) -> str:

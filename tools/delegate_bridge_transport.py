@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -74,7 +75,13 @@ def _bridge_server_path(cfg: dict[str, Any] | None = None) -> Path:
     )
     if configured:
         return Path(str(configured)).expanduser()
-    return Path(__file__).with_name("bridge_mcp_server.js")
+    return Path(__file__).with_name("bridge_mcp_server.py")
+
+
+def _bridge_server_command(bridge_server: Path) -> str:
+    if bridge_server.suffix == ".js":
+        return shutil.which("node") or "node"
+    return sys.executable
 
 
 def _allowed_roots(cfg: dict[str, Any] | None = None) -> list[Path]:
@@ -243,7 +250,7 @@ def _write_claude_mcp_config(
     config = {
         "mcpServers": {
             "worker-bridge": {
-                "command": "node",
+                "command": _bridge_server_command(bridge_server),
                 "args": [str(bridge_server)],
                 "env": {
                     "BRIDGE_SESSION_DIR": str(root),
@@ -290,13 +297,9 @@ def ensure_cursor_bridge_config(
 
     Cursor Agent does not currently expose a per-run --mcp-config flag like
     Claude. The least surprising local bootstrap is to update a project-local
-    `.cursor/mcp.json` entry immediately before spawn. This writes the current
-    session id into the MCP config because Cursor launches MCP servers from the
-    config env, not from the cursor-agent process environment.
-
-    Current limitation: one Cursor bridge worker per workspace at a time. A
-    future transport can avoid this by giving Cursor a per-session workspace or
-    by using a future Cursor --mcp-config equivalent.
+    `.cursor/mcp.json` entry with a shared worker-bridge MCP server. The worker
+    passes its Hermes session id as a tool argument, so parallel Cursor workers
+    can share one workspace MCP config without clobbering each other.
     """
 
     if (cfg or {}).get("cursor_bridge_auto_config") is False:
@@ -325,12 +328,11 @@ def ensure_cursor_bridge_config(
 
     existing = servers.get("worker-bridge")
     desired = {
-        "command": "node",
+        "command": _bridge_server_command(bridge_server),
         "args": [str(bridge_server)],
         "env": {
             "BRIDGE_SESSION_DIR": str(root),
             "AGENT_ORCHESTRATOR_DIR": str(root),
-            "AGENT_ORCHESTRATOR_SESSION_ID": session_id,
             "BRIDGE_POLL_MS": os.environ.get("BRIDGE_POLL_MS", "500"),
             "BRIDGE_TIMEOUT_MS": os.environ.get("BRIDGE_TIMEOUT_MS", "300000"),
         },
@@ -393,7 +395,7 @@ def _build_runtime_metadata(
             "mcp_wiring": (
                 "claude uses per-session worker-bridge.mcp.json with --strict-mcp-config and --allowedTools"
                 if worker_type == "claude"
-                else "cursor-agent uses project .cursor/mcp.json plus --approve-mcps"
+                else "cursor-agent uses shared project .cursor/mcp.json plus --approve-mcps; pass bridge.session_id to report_to_orchestrator"
             ),
             "extra_mcp_server_names": sorted(_bridge_extra_mcp_servers(cfg)),
             "extra_allowed_tools": _bridge_extra_allowed_tools(cfg),
@@ -401,16 +403,60 @@ def _build_runtime_metadata(
     }
 
 
-def _bridge_preamble(worker_type: str, runtime_metadata: dict[str, Any] | None = None) -> str:
+def _bridge_context_tool_guidance(runtime_metadata: dict[str, Any] | None) -> list[str]:
+    if not runtime_metadata:
+        return []
+    bridge = runtime_metadata.get("bridge") if isinstance(runtime_metadata, dict) else None
+    if not isinstance(bridge, dict):
+        return []
+    allowed_tools = [str(tool) for tool in bridge.get("extra_allowed_tools") or []]
+    ctx_tools = sorted(tool for tool in allowed_tools if "__ctx_" in tool)
+    if not ctx_tools:
+        return []
+
+    return [
+        "LEANCTX WORKER CONTRACT: LeanCTX MCP tools are available to this worker. Follow the same preference model installed by `lean-ctx setup`: prefer LeanCTX tools over native equivalents whenever they fit.",
+        "Bridge LeanCTX is a fail-fast helper: try the matching ctx_* tool first, and if it errors, times out, or lacks the needed detail, continue with native tools and mention the fallback in your next report.",
+        "During work:",
+        "- ctx_read: default for file reads; full for files you will edit, map for context-only files, signatures for API surface, diff after edits, lines:N-M for surgical ranges, task/reference for task-relevant or cross-reference reads, auto when unsure.",
+        "- ctx_multi_read: batch related file reads instead of repeated single-file calls when available.",
+        "- ctx_smart_read: use when you know the target but want LeanCTX to choose the best read mode.",
+        "- ctx_delta: use after you or another worker changed a file and you only need changed lines.",
+        "- ctx_search: regex/content search with compact results; prefer before broad shell search.",
+        "- ctx_tree: compact directory maps before reading many files.",
+        "- ctx_shell: non-mutating local commands with compressed output; use raw only when exact output is required.",
+        "- ctx_symbol and ctx_callers: use for named functions/classes and call-site analysis.",
+        "Tool preference map: ctx_tree over ls/tree/find, ctx_read over Read/cat/head/tail/sed, ctx_search over grep/rg/find-by-content, and ctx_shell over raw shell for git/gh/test/build/status commands.",
+        "- ctx_gain/ctx_cost: use for savings/cost evidence when asked or when reporting context efficiency matters.",
+        "Keep LeanCTX output ephemeral: summarize relevant evidence and avoid pasting large raw dumps into bridge reports.",
+        "Deliver context back to Hermes through report_to_orchestrator. Final reports should include ctx_* tools used, any LeanCTX fallback reason, and concise evidence produced.",
+        "Available LeanCTX tool handles: " + ", ".join(ctx_tools),
+    ]
+
+
+def _bridge_preamble(
+    worker_type: str,
+    runtime_metadata: dict[str, Any] | None = None,
+    *,
+    unsafe_allow_writes: bool = False,
+) -> str:
+    write_policy = (
+        "WRITE POLICY: Writes are allowed for this task when necessary. Keep edits scoped and report what changed."
+        if unsafe_allow_writes
+        else "WRITE POLICY: Read-only. Do not edit, create, delete, or run mutating commands; report needed changes instead."
+    )
     parts = [
         "ORCHESTRATION MODE: You are a worker agent supervised by Hermes.",
         "Communicate with the parent ONLY through the report_to_orchestrator MCP tool.",
         "Your first action must call report_to_orchestrator with a one-line acknowledgement and plan.",
+        "Prefix every report_to_orchestrator message with [session_id=HERMES_RUNTIME_CONTEXT.bridge.session_id].",
+        write_policy,
         "Call report_to_orchestrator for clarifying questions, progress, final results, or blockers.",
         "Keep bridge messages concise. Do not inspect secrets or tokens.",
         "Stop only when the task is complete and reported, the parent says stop/done, or you hit a fatal error.",
         f"WORKER TYPE: {worker_type}",
     ]
+    parts.extend(_bridge_context_tool_guidance(runtime_metadata))
     if runtime_metadata:
         metadata = redact_sensitive_text(json.dumps(runtime_metadata, indent=2, sort_keys=True))
         parts.extend(["", "HERMES_RUNTIME_CONTEXT:", metadata])
@@ -432,10 +478,6 @@ def _build_worker_command(
 ) -> tuple[str, list[str]]:
     if worker_type == "claude":
         mcp_config = _write_claude_mcp_config(session_dir, root, session_id, bridge_server, cfg)
-        allowed_tools = [
-            "mcp__worker-bridge__report_to_orchestrator",
-            *_bridge_extra_allowed_tools(cfg),
-        ]
         args = [
             "-p",
             "--model",
@@ -445,11 +487,20 @@ def _build_worker_command(
             "--mcp-config",
             str(mcp_config),
             "--strict-mcp-config",
-            "--allowedTools",
-            ",".join(allowed_tools),
             "--permission-mode",
             _permission_mode(acp_args, unsafe_allow_writes),
         ]
+        # --allowedTools: without it, --strict-mcp-config blocks all MCP calls.
+        # Built-in tools (Bash/Read/Write/Edit/Task/WebSearch/WebFetch/Glob/Grep)
+        # are always available; the flag is needed for MCP tool auto-approval.
+        builtins = [
+            "Bash", "Read", "Write", "Edit", "Task",
+            "WebSearch", "WebFetch", "Glob", "Grep", "NotebookEdit",
+        ]
+        mcp_tools = ["mcp__worker-bridge__report_to_orchestrator"]
+        extra = _bridge_extra_allowed_tools(cfg)
+        allowed = builtins + mcp_tools + extra
+        args.extend(["--allowedTools", ",".join(allowed)])
         max_turns = _value_after(acp_args, "--max-turns")
         if max_turns:
             args.extend(["--max-turns", max_turns])
@@ -468,8 +519,6 @@ def _build_worker_command(
         ]
         if unsafe_allow_writes:
             args.append("--yolo")
-        else:
-            args.extend(["--mode", "plan"])
         args.append(prompt)
         return "cursor-agent", args
 
@@ -547,15 +596,6 @@ def _bridge_activity(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _wait_for_bridge_dir(path: Path, timeout_seconds: float) -> bool:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        if path.exists():
-            return True
-        time.sleep(0.25)
-    return path.exists()
-
-
 def _wait_for_question(root: Path, session_id: str, timeout_seconds: float) -> dict[str, Any] | None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -602,7 +642,7 @@ def spawn_bridge_session(
     model = _extract_model(acp_args)
     task_text = goal if not context else f"{goal}\n\nCONTEXT:\n{context}"
     runtime_metadata = _build_runtime_metadata(worker_type=worker_type, session_id=sid, cwd=cwd, cfg=cfg)
-    prompt = _bridge_preamble(worker_type, runtime_metadata) + "\n\nTASK:\n" + task_text
+    prompt = _bridge_preamble(worker_type, runtime_metadata, unsafe_allow_writes=unsafe_allow_writes) + "\n\nTASK:\n" + task_text
     command, args = _build_worker_command(
         worker_type=worker_type,
         model=model,
@@ -647,8 +687,8 @@ def spawn_bridge_session(
     }
     _save_state(root, sid, state)
 
-    bridge_ready = _wait_for_bridge_dir(bridge_dir, min(max(initial_wait_seconds, 1.0), 30.0))
-    pending = _wait_for_question(root, sid, initial_wait_seconds) if bridge_ready else None
+    pending = _wait_for_question(root, sid, initial_wait_seconds)
+    bridge_ready = bridge_dir.exists()
     status = bridge_status(sid, cfg=cfg)
     return {
         "status": status["status"] if bridge_ready else "starting",

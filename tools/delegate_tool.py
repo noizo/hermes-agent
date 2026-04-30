@@ -41,25 +41,11 @@ from tools.delegate_bridge_transport import (
     terminate_bridge_session,
 )
 from tools.delegate_personas import apply_persona_to_task
+from tools.lean_ctx_client import DEFAULT_BRIDGE_SAFE_TOOL_NAMES
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
-_LEAN_CTX_BRIDGE_TOOL_NAMES = (
-    "ctx_read",
-    "ctx_search",
-    "ctx_tree",
-    "ctx_shell",
-    "ctx_knowledge",
-    "ctx_session",
-    "ctx_task",
-    "ctx_overview",
-    "ctx_preload",
-    "ctx_intent",
-    "ctx_graph",
-    "ctx_symbol",
-    "ctx_callers",
-    "ctx_handoff",
-)
+_LEAN_CTX_BRIDGE_TOOL_NAMES = DEFAULT_BRIDGE_SAFE_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -2073,6 +2059,7 @@ def delegate_task(
                 top_level_transport=transport or default_transport,
                 top_level_acp_command=acp_command,
                 top_level_acp_args=acp_args,
+                top_level_unsafe_allow_writes=unsafe_allow_writes,
             )
             for task in task_list
         ]
@@ -2093,6 +2080,13 @@ def delegate_task(
             return tool_error(
                 "Cannot mix bridge transport tasks with embedded/simple-pipe tasks "
                 "in one delegate_task call. Split them into separate calls."
+            )
+        for task in task_list:
+            task["context"] = _augment_task_context_with_bootstrap(
+                parent_agent,
+                goal=task["goal"],
+                context=task.get("context"),
+                workspace_hint=task.get("workdir") or workdir,
             )
         return _delegate_bridge_tasks(
             task_list=task_list,

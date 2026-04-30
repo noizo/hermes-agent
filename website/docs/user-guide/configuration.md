@@ -85,7 +85,7 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 
 Context bootstrap providers add ephemeral project context to the next user message. They run alongside the context compressor and the configured memory provider.
 
-Lean-ctx activates from the native `lean_ctx` config section. With `enabled: auto`, Hermes uses `which lean-ctx` semantics through `PATH` and activates the layer when the configured command is available. Hermes follows the lean-ctx author workflow at session start: load the local `ctx_session`, wake and summarize `ctx_knowledge`, classify intent with `ctx_intent`, collect `ctx_overview`/`ctx_preload`, check `ctx_graph` status, and add bounded symbol/caller probes when the task names symbols. The resulting packet is appended to the current API request as ephemeral project context for first-turn parent sessions and delegated child tasks. When tool routing is enabled, the visible `read_file`, `search_files`, and eligible foreground local `terminal` commands can also use lean-ctx internally with native fallback after Hermes' normal safety checks. Set `code_task_only: true` for heuristic gating to obvious code tasks.
+Lean-ctx activates from the native `lean_ctx` config section. With `enabled: auto`, Hermes uses `which lean-ctx` semantics through `PATH` and activates the layer when the configured command is available. Hermes follows the lean-ctx author workflow at session start: load `ctx_session`, record the task, wake and check `ctx_knowledge`, classify scope with `ctx_intent`, use `ctx_overview` for broad orientation, use `ctx_preload` for multi-file or cross-module work, check `ctx_graph` for dependency or impact context, inspect `ctx_handoff` when continuing prior agent/session work, and add bounded `ctx_symbol`/`ctx_callers` probes when the task names symbols. Narrow single-file tasks can skip broad overview/preload and use surgical `ctx_read` modes instead. The resulting packet is appended to the current API request as ephemeral project context for first-turn parent sessions and delegated child tasks. When tool routing is enabled, the visible `read_file`, `search_files`, and eligible foreground local `terminal` commands can also use lean-ctx internally with native fallback after Hermes' normal safety checks. Set `code_task_only: true` for heuristic gating to obvious code tasks.
 
 ```yaml
 lean_ctx:
@@ -106,6 +106,18 @@ lean_ctx:
   include_graph_status: true
   expose_to_bridge_workers: true
   bridge_mcp_server_name: lean-ctx
+  bridge_safe_tools:
+    - ctx_read
+    - ctx_multi_read
+    - ctx_smart_read
+    - ctx_delta
+    - ctx_search
+    - ctx_tree
+    - ctx_shell
+    - ctx_symbol
+    - ctx_callers
+    - ctx_gain
+    - ctx_cost
   max_chars: 12000
   delegation_max_chars: 6000
   max_task_chars: 4000
@@ -116,7 +128,7 @@ Hermes keeps a small process-local savings counter for routed lean-ctx calls and
 
 `max_chars` and `delegation_max_chars` cap only the lean-ctx context packet appended by Hermes. They do not truncate the user's instruction or the persona/task prompt. `max_task_chars` caps the task text sent to lean-ctx for retrieval so large instructions do not turn into oversized retrieval queries.
 
-With `expose_to_bridge_workers: true`, Hermes also adds lean-ctx to the native bridge worker MCP surface. Claude workers receive it through the generated per-session MCP config plus `bridge_extra_allowed_tools`; Cursor workers receive it through the project Cursor MCP config alongside `worker-bridge`. This is separate from the text context packet, so smoke tests should verify both the parent-routed lean-ctx context and the worker-visible lean-ctx MCP tools.
+With `expose_to_bridge_workers: true`, Hermes also adds a bridge-safe lean-ctx MCP facade to native bridge workers. Claude workers receive it through the generated per-session MCP config plus `bridge_extra_allowed_tools`; Cursor workers receive the same packaged facade through the project Cursor MCP config alongside `worker-bridge`. The facade is deliberately stateless and fail-fast: it exposes only `bridge_safe_tools`, maps them to bounded lean-ctx CLI calls, and leaves stateful session/preload/intent workflow to the parent-side context bootstrap packet. Bridge workers receive a purpose-based LeanCTX contract that prefers `ctx_read`, `ctx_multi_read`, `ctx_smart_read`, `ctx_delta`, `ctx_search`, `ctx_tree`, `ctx_shell`, `ctx_symbol`, and `ctx_callers` over native read/search/tree/shell equivalents for evidence gathering, while continuing with native tools if the facade errors or lacks detail. Parent-side terminal routing also recognizes common wrapper chains such as `sleep ... && cd ... && gh run list ...` before deciding whether a read-oriented command can be compressed. This is separate from the text context packet, so smoke tests should verify both the parent-routed lean-ctx context and the worker-visible lean-ctx MCP tools.
 
 ## Terminal Backend Configuration
 
@@ -1467,10 +1479,10 @@ delegation:
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
   # persona_dirs:                           # Optional native delegate_task persona pools
   #   project: "~/.hermes/personas/project"
-  # persona_provider: "cursor-agent"        # Optional canonical provider for persona-backed local CLI children
-                                            # Valid: "claude" or "cursor-agent". If unset, plain
-                                            # delegate_task keeps embedded API behavior unless a
-                                            # call explicitly supplies persona_provider/acp_command.
+  # persona_provider: "cursor-agent"        # Fallback canonical provider for unclassified personas.
+                                           # Built-in role routing sends code/fix personas to
+                                           # cursor-agent and review/verify/design personas to claude.
+                                           # Explicit persona_provider/acp_command still wins.
   # persona_workdir: "~/code/project"       # Optional default workdir for persona-backed bridge workers
   # bridge_extra_mcp_servers:               # Extra MCPs for bridge workers
   #   hindsight-memory:                     # Example: Hindsight or another memory MCP
@@ -1482,7 +1494,7 @@ delegation:
 
 **Transport selection:** `delegation.default_transport: "auto"` prefers `bridge` for bridge-capable Claude/Cursor personas or commands. Use `embedded-api` for native API-key child agents, `simple-pipe` only for legacy one-shot CLI compatibility, and `experimental-oauth` only for explicit local proxy/OAuth experiments.
 
-**Bridge personas:** `persona`, `persona_provider`, `persona_model`, and `persona_workdir` route a delegated child to a named local Claude Code or Cursor Agent persona without changing the parent `SOUL.md` or `/personality`. `persona_provider` uses canonical names only: `claude` or `cursor-agent`. If omitted, Hermes uses `delegation.persona_provider` when configured; if neither is set, plain delegation keeps embedded API behavior. Bridge workers own their local CLI auth; Hermes does not inspect, copy, refresh, migrate, or inject OAuth tokens.
+**Bridge personas:** `persona`, `persona_provider`, `persona_model`, and `persona_workdir` route a delegated child to a named local Claude Code or Cursor Agent persona without changing the parent `SOUL.md` or `/personality`. `persona_provider` uses canonical names only: `claude` or `cursor-agent`. If omitted, Hermes applies built-in role routing first: implementation/fix personas default to Cursor Agent with GPT, while review/verification/design/research personas default to Claude Opus. `delegation.persona_provider` is only the fallback for unclassified personas. To intentionally keep embedded API execution, omit `persona` or set `transport="embedded-api"`; in that embedded case the persona name is not expanded into local CLI context. Bridge workers own their local CLI auth; Hermes does not inspect, copy, refresh, migrate, or inject OAuth tokens.
 
 **Worker MCPs:** Claude bridge workers receive a strict generated MCP config. Add shared worker memory MCPs with `bridge_extra_mcp_servers` and expose only the needed Claude tools with `bridge_extra_allowed_tools`. Cursor bridge workers use project Cursor MCP config plus `--approve-mcps`; Hermes writes `worker-bridge` and merges configured `bridge_extra_mcp_servers` into `.cursor/mcp.json`, but Cursor does not use Claude Code's `--mcp-config` or `--allowedTools` flags.
 

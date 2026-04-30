@@ -103,7 +103,7 @@ class TestDelegatePersonas(unittest.TestCase):
         self.assertFalse(persona_can_write("preimplementer-notes"))
         self.assertFalse(persona_can_write("latest-validator"))
 
-    def test_apply_persona_builds_safe_cursor_bridge_task(self):
+    def test_review_persona_routes_to_claude_opus_despite_cursor_config_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             personas = Path(tmp) / "personas"
             workdir = Path(tmp) / "repo"
@@ -113,18 +113,61 @@ class TestDelegatePersonas(unittest.TestCase):
 
             task = apply_persona_to_task(
                 {"goal": "Review this change", "persona": "code-reviewer"},
+                cfg={
+                    "persona_dirs": {"project": str(personas)},
+                    "persona_provider": "cursor-agent",
+                },
+                top_level_workdir=str(workdir),
+            )
+
+            self.assertEqual(task["acp_command"], "claude")
+            self.assertEqual(task["transport"], "bridge")
+            self.assertFalse(task["unsafe_allow_writes"])
+            self.assertIn("--model", task["acp_args"])
+            self.assertIn("opus", task["acp_args"])
+            self.assertIn("--permission-mode", task["acp_args"])
+            self.assertIn("plan", task["acp_args"])
+            self.assertIn("# DELEGATED PERSONA: code-reviewer", task["context"])
+            self.assertIn(str(workdir), task["context"])
+
+    def test_coding_persona_routes_to_cursor_gpt_bridge_without_provider_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            workdir = Path(tmp) / "repo"
+            personas.mkdir()
+            workdir.mkdir()
+            _write_persona(personas, "implementer", "# Role\nImplement changes.")
+
+            task = apply_persona_to_task(
+                {"goal": "Implement this change", "persona": "implementer"},
                 cfg={"persona_dirs": {"project": str(personas)}},
-                top_level_provider="cursor-agent",
                 top_level_workdir=str(workdir),
             )
 
             self.assertEqual(task["acp_command"], "cursor-agent")
             self.assertEqual(task["transport"], "bridge")
-            self.assertFalse(task["unsafe_allow_writes"])
-            self.assertIn("--mode", task["acp_args"])
-            self.assertIn("plan", task["acp_args"])
-            self.assertIn("# DELEGATED PERSONA: code-reviewer", task["context"])
-            self.assertIn(str(workdir), task["context"])
+            self.assertTrue(task["unsafe_allow_writes"])
+            self.assertIn("--model", task["acp_args"])
+            self.assertIn("gpt-5.5-extra-high", task["acp_args"])
+            self.assertIn("--yolo", task["acp_args"])
+
+    def test_explicit_persona_provider_still_overrides_role_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            workdir = Path(tmp) / "repo"
+            personas.mkdir()
+            workdir.mkdir()
+            _write_persona(personas, "code-reviewer", "# Role\nReview safely.")
+
+            task = apply_persona_to_task(
+                {"goal": "Review with Cursor explicitly", "persona": "code-reviewer", "persona_provider": "cursor-agent"},
+                cfg={"persona_dirs": {"project": str(personas)}},
+                top_level_workdir=str(workdir),
+            )
+
+            self.assertEqual(task["acp_command"], "cursor-agent")
+            self.assertEqual(task["_persona_meta"]["provider"], "cursor-agent")
+            self.assertIn("gpt-5.5-extra-high", task["acp_args"])
 
     def test_apply_persona_treats_empty_top_level_acp_args_as_unset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +186,25 @@ class TestDelegatePersonas(unittest.TestCase):
             )
 
             self.assertEqual(task["acp_args"], ["-p", "--output-format", "text", "--model", "gpt-5.5-extra-high", "--mode", "plan"])
+
+    def test_top_level_write_mode_updates_cursor_reviewer_persona_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            workdir = Path(tmp) / "repo"
+            personas.mkdir()
+            workdir.mkdir()
+            _write_persona(personas, "code-reviewer", "# Role\nReview and patch when approved.")
+
+            task = apply_persona_to_task(
+                {"goal": "Review and write report", "persona": "code-reviewer", "persona_provider": "cursor-agent"},
+                cfg={"persona_dirs": {"project": str(personas)}},
+                top_level_workdir=str(workdir),
+                top_level_unsafe_allow_writes=True,
+            )
+
+            self.assertTrue(task["unsafe_allow_writes"])
+            self.assertIn("--yolo", task["acp_args"])
+            self.assertNotIn("--mode", task["acp_args"])
 
     def test_apply_persona_builds_safe_claude_args(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +227,27 @@ class TestDelegatePersonas(unittest.TestCase):
             self.assertIn("--add-dir", task["acp_args"])
             self.assertIn(str(workdir), task["acp_args"])
 
+    def test_top_level_write_mode_updates_claude_reviewer_persona_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            workdir = Path(tmp) / "repo"
+            personas.mkdir()
+            workdir.mkdir()
+            _write_persona(personas, "verifier", "# Role\nVerify and write report when approved.")
+
+            task = apply_persona_to_task(
+                {"goal": "Verify and write report", "persona": "verifier"},
+                cfg={"persona_dirs": {"project": str(personas)}},
+                top_level_provider="claude",
+                top_level_workdir=str(workdir),
+                top_level_unsafe_allow_writes=True,
+            )
+
+            self.assertTrue(task["unsafe_allow_writes"])
+            self.assertIn("--permission-mode", task["acp_args"])
+            mode_index = task["acp_args"].index("--permission-mode") + 1
+            self.assertEqual(task["acp_args"][mode_index], "acceptEdits")
+
     def test_apply_persona_write_persona_marks_unsafe_but_does_not_approve(self):
         with tempfile.TemporaryDirectory() as tmp:
             personas = Path(tmp) / "personas"
@@ -181,16 +264,16 @@ class TestDelegatePersonas(unittest.TestCase):
             self.assertTrue(task["unsafe_allow_writes"])
             self.assertIn("--yolo", task["acp_args"])
 
-    def test_apply_persona_uses_configured_canonical_provider(self):
+    def test_apply_persona_uses_configured_canonical_provider_for_unclassified_personas(self):
         with tempfile.TemporaryDirectory() as tmp:
             personas = Path(tmp) / "personas"
             workdir = Path(tmp) / "repo"
             personas.mkdir()
             workdir.mkdir()
-            _write_persona(personas, "verifier", "# Role\nVerify safely.")
+            _write_persona(personas, "domain-specialist", "# Role\nSpecialist analysis.")
 
             task = apply_persona_to_task(
-                {"goal": "Verify", "persona": "verifier"},
+                {"goal": "Analyze", "persona": "domain-specialist"},
                 cfg={
                     "persona_dirs": {"project": str(personas)},
                     "persona_provider": "cursor-agent",
@@ -206,11 +289,11 @@ class TestDelegatePersonas(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             personas = Path(tmp) / "personas"
             personas.mkdir()
-            _write_persona(personas, "verifier", "# Role\nVerify safely.")
+            _write_persona(personas, "domain-specialist", "# Role\nSpecialist analysis.")
 
             with self.assertRaisesRegex(ValueError, "requires canonical persona_provider"):
                 apply_persona_to_task(
-                    {"goal": "Verify", "persona": "verifier"},
+                    {"goal": "Analyze", "persona": "domain-specialist"},
                     cfg={"persona_dirs": {"project": str(personas)}},
                 )
 
@@ -274,6 +357,47 @@ class TestDelegateTaskPersonaIntegration(unittest.TestCase):
             self.assertIn("# DELEGATED PERSONA: verifier", kwargs["context"])
             mock_creds.assert_not_called()
 
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool.spawn_bridge_session")
+    @patch("tools.delegate_tool._load_config")
+    def test_delegate_task_routes_review_persona_to_claude_over_cursor_config(self, mock_cfg, mock_spawn, mock_creds):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            workdir = Path(tmp) / "repo"
+            personas.mkdir()
+            workdir.mkdir()
+            _write_persona(personas, "code-reviewer", "# Role\nReview completion.")
+            mock_cfg.return_value = {
+                "max_iterations": 45,
+                "persona_dirs": {"project": str(personas)},
+                "persona_provider": "cursor-agent",
+            }
+            mock_spawn.return_value = {
+                "session_id": "hermes-code-reviewer",
+                "status": "waiting_for_reply",
+                "worker_type": "claude",
+                "model": "opus",
+                "pid": 123,
+                "bridge_ready": True,
+                "pending": {"message": "ready"},
+            }
+
+            result = json.loads(
+                delegate_task(
+                    goal="Review this change",
+                    persona="code-reviewer",
+                    workdir=str(workdir),
+                    parent_agent=_make_parent(),
+                )
+            )
+
+            self.assertEqual(result["transport"], "bridge")
+            _, kwargs = mock_spawn.call_args
+            self.assertEqual(kwargs["acp_command"], "claude")
+            self.assertIn("opus", kwargs["acp_args"])
+            self.assertIn("plan", kwargs["acp_args"])
+            mock_creds.assert_not_called()
+
     @patch("tools.delegate_tool.spawn_bridge_session")
     @patch("tools.delegate_tool._load_config")
     def test_delegate_task_write_persona_still_requires_operator_gate(self, mock_cfg, mock_spawn):
@@ -300,6 +424,45 @@ class TestDelegateTaskPersonaIntegration(unittest.TestCase):
             self.assertIn("error", result)
             self.assertIn("unsafe_allow_writes requires operator approval", result["error"])
             mock_spawn.assert_not_called()
+
+    @patch("tools.delegate_tool.spawn_bridge_session")
+    @patch("tools.delegate_tool._load_config")
+    def test_delegate_task_top_level_write_mode_reaches_reviewer_persona(self, mock_cfg, mock_spawn):
+        with tempfile.TemporaryDirectory() as tmp:
+            personas = Path(tmp) / "personas"
+            personas.mkdir()
+            _write_persona(personas, "code-reviewer", "# Role\nReview and write a report.")
+            mock_cfg.return_value = {
+                "max_iterations": 45,
+                "allow_unsafe_acp_writes": True,
+                "persona_dirs": {"project": str(personas)},
+                "persona_provider": "claude",
+            }
+            mock_spawn.return_value = {
+                "status": "waiting_for_reply",
+                "session_id": "hermes-code-reviewer",
+                "worker_type": "claude",
+                "model": "sonnet",
+                "pid": 123,
+                "bridge_ready": True,
+                "pending": {"message": "ready"},
+            }
+
+            result = json.loads(
+                delegate_task(
+                    goal="Review and write docs/review.md",
+                    persona="code-reviewer",
+                    persona_provider="claude",
+                    unsafe_allow_writes=True,
+                    workdir=tmp,
+                    parent_agent=_make_parent(),
+                )
+            )
+
+            self.assertEqual(result["transport"], "bridge")
+            _, kwargs = mock_spawn.call_args
+            self.assertTrue(kwargs["unsafe_allow_writes"])
+            self.assertIn("acceptEdits", kwargs["acp_args"])
 
     @patch("tools.delegate_tool._load_config")
     def test_delegate_task_unknown_persona_returns_tool_error(self, mock_cfg):

@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -148,10 +149,10 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertEqual(config_path, cwd / ".cursor" / "mcp.json")
             data = json.loads(config_path.read_text())
             server = data["mcpServers"]["worker-bridge"]
-            self.assertEqual(server["command"], "node")
+            self.assertEqual(server["command"], shutil.which("node") or "node")
             self.assertEqual(server["args"], [str(bridge_server)])
             self.assertEqual(server["env"]["BRIDGE_SESSION_DIR"], str(root))
-            self.assertEqual(server["env"]["AGENT_ORCHESTRATOR_SESSION_ID"], "hermes-test")
+            self.assertNotIn("AGENT_ORCHESTRATOR_SESSION_ID", server["env"])
 
     def test_cursor_bridge_config_preserves_existing_servers(self):
         from tools.delegate_bridge_transport import ensure_cursor_bridge_config
@@ -207,15 +208,23 @@ class TestBridgeTransportConfig(unittest.TestCase):
             self.assertEqual(servers["shared-memory"]["url"], "https://memory.example.com/mcp/")
             self.assertEqual(servers["lean-ctx"]["command"], "lean-ctx")
 
-    def test_lean_ctx_augments_bridge_mcp_servers_and_claude_allowed_tools(self):
+    def test_lean_ctx_augments_bridge_mcp_servers_with_bridge_safe_profile(self):
         import hermes_cli.config as hermes_config
         import tools.lean_ctx_client as lean_ctx_client
+
+        original_which = shutil.which
+
+        def fake_which(command):
+            return {
+                "lean-ctx": "/usr/local/bin/lean-ctx",
+                "node": original_which("node") or "node",
+            }.get(command)
 
         with patch.object(
             hermes_config,
             "load_config",
             return_value={"lean_ctx": {"enabled": True, "command": "lean-ctx"}},
-        ), patch.object(lean_ctx_client.shutil, "which", return_value="/usr/local/bin/lean-ctx"):
+        ), patch.object(lean_ctx_client.shutil, "which", side_effect=fake_which):
             cfg = _augment_bridge_config_with_lean_ctx(
                 {
                     "bridge_extra_mcp_servers": {
@@ -227,12 +236,69 @@ class TestBridgeTransportConfig(unittest.TestCase):
 
         servers = cfg["bridge_extra_mcp_servers"]
         self.assertIn("shared-memory", servers)
-        self.assertEqual(servers["lean-ctx"]["command"], "lean-ctx")
-        self.assertIn("mcp__shared-memory__recall", cfg["bridge_extra_allowed_tools"])
-        self.assertIn("mcp__lean-ctx__ctx_read", cfg["bridge_extra_allowed_tools"])
-        self.assertIn("mcp__lean-ctx__ctx_knowledge", cfg["bridge_extra_allowed_tools"])
+        self.assertEqual(servers["lean-ctx"]["command"], shutil.which("node") or "node")
+        self.assertEqual(Path(servers["lean-ctx"]["args"][0]).name, "lean_ctx_bridge_mcp_server.js")
+        self.assertEqual(servers["lean-ctx"]["env"]["LEAN_CTX_COMMAND"], "lean-ctx")
 
-    def test_cursor_bridge_config_updates_session_id_for_next_spawn(self):
+        safe_tools = {
+            "ctx_read",
+            "ctx_multi_read",
+            "ctx_smart_read",
+            "ctx_delta",
+            "ctx_search",
+            "ctx_tree",
+            "ctx_shell",
+            "ctx_symbol",
+            "ctx_callers",
+            "ctx_gain",
+            "ctx_cost",
+        }
+        allowed = cfg["bridge_extra_allowed_tools"]
+        self.assertIn("mcp__shared-memory__recall", allowed)
+        for tool_name in safe_tools:
+            self.assertIn(f"mcp__lean-ctx__{tool_name}", allowed)
+        for tool_name in {"ctx_session", "ctx_preload", "ctx_intent", "ctx_knowledge", "ctx_share"}:
+            self.assertNotIn(f"mcp__lean-ctx__{tool_name}", allowed)
+
+    def test_cursor_bridge_config_receives_same_bridge_safe_lean_ctx_server(self):
+        from tools.delegate_bridge_transport import ensure_cursor_bridge_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "repo"
+            cwd.mkdir()
+            root = Path(tmp) / "cache"
+            bridge_server = Path(tmp) / "bridge-mcp" / "server.js"
+            bridge_server.parent.mkdir()
+            bridge_server.write_text("// test\n")
+            lean_ctx_server = {
+                "command": shutil.which("node") or "node",
+                "args": [str(Path(tmp) / "lean_ctx_bridge_mcp_server.js")],
+                "env": {
+                    "LEAN_CTX_COMMAND": "lean-ctx",
+                    "LEAN_CTX_BRIDGE_SAFE_TOOLS": "ctx_read,ctx_search,ctx_tree,ctx_shell",
+                },
+            }
+
+            ensure_cursor_bridge_config(
+                cwd,
+                root,
+                bridge_server,
+                "hermes-test",
+                {
+                    "bridge_extra_mcp_servers": {"lean-ctx": lean_ctx_server},
+                    "bridge_extra_allowed_tools": [
+                        "mcp__lean-ctx__ctx_read",
+                        "mcp__lean-ctx__ctx_search",
+                        "mcp__lean-ctx__ctx_tree",
+                        "mcp__lean-ctx__ctx_shell",
+                    ],
+                },
+            )
+
+            servers = json.loads((cwd / ".cursor" / "mcp.json").read_text())["mcpServers"]
+            self.assertEqual(servers["lean-ctx"], lean_ctx_server)
+
+    def test_cursor_bridge_config_is_shared_across_parallel_sessions(self):
         from tools.delegate_bridge_transport import ensure_cursor_bridge_config
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,7 +314,8 @@ class TestBridgeTransportConfig(unittest.TestCase):
 
             data = json.loads((cwd / ".cursor" / "mcp.json").read_text())
             env = data["mcpServers"]["worker-bridge"]["env"]
-            self.assertEqual(env["AGENT_ORCHESTRATOR_SESSION_ID"], "hermes-two")
+            self.assertNotIn("AGENT_ORCHESTRATOR_SESSION_ID", env)
+            self.assertEqual(env["BRIDGE_SESSION_DIR"], str(root))
 
     def test_claude_bridge_config_includes_configured_extra_mcp_servers_only(self):
         from tools.delegate_bridge_transport import _write_claude_mcp_config
@@ -277,6 +344,7 @@ class TestBridgeTransportConfig(unittest.TestCase):
 
             servers = json.loads(config_path.read_text())["mcpServers"]
             self.assertEqual(set(servers), {"worker-bridge", "shared-memory"})
+            self.assertEqual(servers["worker-bridge"]["command"], shutil.which("node") or "node")
             self.assertEqual(servers["shared-memory"]["url"], "https://memory.example.com/mcp/")
 
     def test_claude_bridge_allows_configured_extra_mcp_tools(self):
@@ -306,12 +374,23 @@ class TestBridgeTransportConfig(unittest.TestCase):
             )
 
             self.assertEqual(command, "claude")
-            allowed = args[args.index("--allowedTools") + 1]
+            # Claude requires --allowedTools to auto-approve MCP tool calls.
+            # Without it, --strict-mcp-config blocks all MCP tools
+            # (report_to_orchestrator, hindsight, lean-ctx).
+            self.assertIn("--allowedTools", args)
+            allowed_idx = args.index("--allowedTools") + 1
+            allowed = args[allowed_idx].split(",")
             self.assertIn("mcp__worker-bridge__report_to_orchestrator", allowed)
             self.assertIn("mcp__shared-memory__recall", allowed)
             self.assertIn("mcp__shared-memory__reflect", allowed)
+            self.assertIn("Bash", allowed)
+            self.assertIn("Write", allowed)
+            self.assertIn("--mcp-config", args)
+            mcp_cfg_idx = args.index("--mcp-config") + 1
+            mcp_cfg_path = args[mcp_cfg_idx]
+            self.assertTrue(Path(mcp_cfg_path).exists(), f"MCP config missing: {mcp_cfg_path}")
 
-    def test_cursor_bridge_uses_workspace_mcp_config_not_claude_flags(self):
+    def test_cursor_bridge_uses_agent_mode_with_workspace_mcp_config(self):
         from tools.delegate_bridge_transport import _build_worker_command
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,11 +409,32 @@ class TestBridgeTransportConfig(unittest.TestCase):
 
             self.assertEqual(command, "cursor-agent")
             self.assertIn("--approve-mcps", args)
-            self.assertIn("--mode", args)
-            self.assertIn("plan", args)
+            self.assertNotIn("--mode", args)
+            self.assertNotIn("--yolo", args)
             self.assertNotIn("--mcp-config", args)
             self.assertNotIn("--strict-mcp-config", args)
             self.assertNotIn("--allowedTools", args)
+
+    def test_cursor_bridge_write_mode_uses_yolo_without_prompt_mode(self):
+        from tools.delegate_bridge_transport import _build_worker_command
+
+        with tempfile.TemporaryDirectory() as tmp:
+            command, args = _build_worker_command(
+                worker_type="cursor-agent",
+                model="gpt-5.5-extra-high",
+                prompt="test",
+                unsafe_allow_writes=True,
+                acp_args=[],
+                session_dir=Path(tmp) / "session",
+                root=Path(tmp) / "cache",
+                session_id="hermes-test",
+                bridge_server=Path(tmp) / "bridge-mcp" / "server.js",
+                cfg={},
+            )
+
+            self.assertEqual(command, "cursor-agent")
+            self.assertIn("--yolo", args)
+            self.assertNotIn("--mode", args)
 
     def test_bridge_preamble_includes_runtime_context_without_skill_docs(self):
         from tools.delegate_bridge_transport import _bridge_preamble
@@ -354,6 +454,65 @@ class TestBridgeTransportConfig(unittest.TestCase):
         self.assertIn("HERMES_RUNTIME_CONTEXT", prompt)
         self.assertIn("hermes-test", prompt)
         self.assertIn("shared-memory", prompt)
+        self.assertIn("[session_id=HERMES_RUNTIME_CONTEXT.bridge.session_id]", prompt)
+        self.assertIn("WRITE POLICY: Read-only.", prompt)
+
+    def test_bridge_preamble_guides_workers_to_available_lean_ctx_tools(self):
+        from tools.delegate_bridge_transport import _bridge_preamble
+
+        prompt = _bridge_preamble(
+            "claude",
+            {
+                "bridge": {
+                    "session_id": "hermes-test",
+                    "extra_mcp_server_names": ["lean-ctx"],
+                    "extra_allowed_tools": [
+                        "mcp__lean-ctx__ctx_read",
+                        "mcp__lean-ctx__ctx_multi_read",
+                        "mcp__lean-ctx__ctx_smart_read",
+                        "mcp__lean-ctx__ctx_delta",
+                        "mcp__lean-ctx__ctx_search",
+                        "mcp__lean-ctx__ctx_tree",
+                        "mcp__lean-ctx__ctx_shell",
+                        "mcp__lean-ctx__ctx_symbol",
+                        "mcp__lean-ctx__ctx_callers",
+                        "mcp__lean-ctx__ctx_gain",
+                        "mcp__lean-ctx__ctx_cost",
+                    ],
+                },
+            },
+        )
+
+        self.assertIn("LEANCTX WORKER CONTRACT", prompt)
+        self.assertIn("prefer LeanCTX tools over native equivalents whenever they fit", prompt)
+        self.assertIn("Bridge LeanCTX is a fail-fast helper", prompt)
+        self.assertIn("ctx_tree over ls/tree/find", prompt)
+        self.assertIn("ctx_read over Read/cat/head/tail/sed", prompt)
+        self.assertIn("ctx_search over grep/rg/find-by-content", prompt)
+        self.assertIn("ctx_shell over raw shell for git/gh/test/build/status commands", prompt)
+        self.assertIn("ctx_multi_read: batch related file reads", prompt)
+        self.assertIn("ctx_delta: use after you or another worker changed a file", prompt)
+        self.assertIn("continue with native tools", prompt)
+        self.assertIn("mcp__lean-ctx__ctx_read", prompt)
+        self.assertNotIn("ctx_session", prompt)
+        self.assertNotIn("ctx_preload", prompt)
+        self.assertNotIn("ctx_intent", prompt)
+
+    def test_bridge_preamble_omits_lean_ctx_guidance_without_ctx_tools(self):
+        from tools.delegate_bridge_transport import _bridge_preamble
+
+        prompt = _bridge_preamble(
+            "claude",
+            {
+                "bridge": {
+                    "session_id": "hermes-test",
+                    "extra_mcp_server_names": ["shared-memory"],
+                    "extra_allowed_tools": ["mcp__shared-memory__recall"],
+                },
+            },
+        )
+
+        self.assertNotIn("LEANCTX WORKER CONTRACT", prompt)
 
     def test_delegation_info_schema_is_native_tool_surface(self):
         self.assertEqual(DELEGATE_DELEGATION_INFO_SCHEMA["name"], "delegate_delegation_info")
@@ -363,7 +522,7 @@ class TestBridgeTransportConfig(unittest.TestCase):
 
         bridge_server = _bridge_server_path({})
 
-        self.assertEqual(bridge_server.name, "bridge_mcp_server.js")
+        self.assertEqual(bridge_server.name, "bridge_mcp_server.py")
         self.assertTrue(bridge_server.exists())
         self.assertEqual(bridge_server.parent.name, "tools")
 
@@ -1593,6 +1752,41 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         self.assertEqual(result["results"][0]["bridge_session_id"], "hermes-test")
         mock_creds.assert_not_called()
         mock_spawn.assert_called_once()
+
+    @patch("tools.delegate_tool.spawn_bridge_session")
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_bridge_transport_includes_delegated_context_bootstrap(self, mock_creds, mock_cfg, mock_spawn):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.side_effect = AssertionError("credential resolution should be skipped")
+        mock_spawn.return_value = {
+            "status": "starting",
+            "session_id": "hermes-test",
+            "worker_type": "claude",
+            "model": "opus",
+            "pid": 123,
+            "pending": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._context_bootstrap_manager = MagicMock()
+        parent._context_bootstrap_manager.context_for_delegation.return_value = (
+            "LEAN-CTX DELEGATION CONTEXT\nctx_overview result"
+        )
+
+        result = json.loads(delegate_task(
+            goal="Bridge context test",
+            context="Persona context",
+            parent_agent=parent,
+            acp_command="claude",
+            acp_args=["-p", "--model", "opus"],
+            transport="bridge",
+        ))
+
+        self.assertEqual(result["transport"], "bridge")
+        _, kwargs = mock_spawn.call_args
+        self.assertIn("Persona context", kwargs["context"])
+        self.assertIn("LEAN-CTX DELEGATION CONTEXT", kwargs["context"])
+        parent._context_bootstrap_manager.context_for_delegation.assert_called_once()
 
     @patch("tools.delegate_tool.spawn_bridge_session")
     @patch("tools.delegate_tool._load_config")

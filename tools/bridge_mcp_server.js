@@ -15,17 +15,14 @@ const SESSION_DIR =
   process.env.BRIDGE_SESSION_DIR ||
   process.env.AGENT_ORCHESTRATOR_DIR ||
   path.join(HOME, ".hermes", "cache", "agent-orchestrator");
-const rawSessionId = process.env.AGENT_ORCHESTRATOR_SESSION_ID || String(process.pid);
-const safeSessionId = rawSessionId.replace(/[^A-Za-z0-9._-]/g, "_");
-const BRIDGE_DIR = path.join(SESSION_DIR, `bridge-${safeSessionId}`);
+const rawDefaultSessionId = process.env.AGENT_ORCHESTRATOR_SESSION_ID || "";
+const safeDefaultSessionId = rawDefaultSessionId.replace(/[^A-Za-z0-9._-]/g, "_");
 const POLL_MS = Number.parseInt(process.env.BRIDGE_POLL_MS || "500", 10);
 const TIMEOUT_MS = Number.parseInt(process.env.BRIDGE_TIMEOUT_MS || "300000", 10);
 const HEARTBEAT_MS = 30_000;
 
-fs.mkdirSync(BRIDGE_DIR, { recursive: true });
-
 let buffer = Buffer.alloc(0);
-let turnCounter = 0;
+const turnCounters = new Map();
 
 function log(message) {
   process.stderr.write(`[worker-bridge ${process.pid}] ${message}\n`);
@@ -43,6 +40,15 @@ function writeMessage(message) {
 
 function makeError(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
+}
+
+function safeSessionId(sessionId) {
+  const raw = String(sessionId || safeDefaultSessionId || process.pid).trim();
+  return raw.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function bridgeDirForSession(sessionId) {
+  return path.join(SESSION_DIR, `bridge-${safeSessionId(sessionId)}`);
 }
 
 function tryReadMessage() {
@@ -90,21 +96,33 @@ const reportTool = {
     type: "object",
     properties: {
       message: { type: "string", minLength: 1 },
+      session_id: {
+        type: "string",
+        description:
+          "Optional Hermes bridge session id from HERMES_RUNTIME_CONTEXT.bridge.session_id. Required for shared Cursor Agent MCP configs with parallel workers.",
+      },
     },
     required: ["message"],
     additionalProperties: false,
   },
 };
 
-async function reportToOrchestrator(message, meta) {
-  turnCounter += 1;
-  const turn = turnCounter;
+async function reportToOrchestrator(message, sessionId, meta) {
+  const safeSession = safeSessionId(sessionId);
+  const bridgeDir = bridgeDirForSession(safeSession);
+  fs.mkdirSync(bridgeDir, { recursive: true });
+  const turn = (turnCounters.get(safeSession) || 0) + 1;
+  turnCounters.set(safeSession, turn);
   const startTime = Date.now();
-  const questionFile = path.join(BRIDGE_DIR, `question_${turn}.json`);
-  const answerFile = path.join(BRIDGE_DIR, `answer_${turn}.json`);
+  const questionFile = path.join(bridgeDir, `question_${turn}.json`);
+  const answerFile = path.join(bridgeDir, `answer_${turn}.json`);
 
-  fs.writeFileSync(questionFile, JSON.stringify({ turn, message, timestamp: Date.now() }), "utf8");
-  log(`turn ${turn} question written`);
+  fs.writeFileSync(
+    questionFile,
+    JSON.stringify({ turn, message, session_id: safeSession, timestamp: Date.now() }),
+    "utf8",
+  );
+  log(`session ${safeSession} turn ${turn} question written`);
 
   const deadline = Date.now() + TIMEOUT_MS;
   let lastHeartbeat = Date.now();
@@ -121,7 +139,7 @@ async function reportToOrchestrator(message, meta) {
         try {
           fs.unlinkSync(answerFile);
         } catch {}
-        log(`turn ${turn} answer received after ${Math.round((Date.now() - startTime) / 1000)}s`);
+        log(`session ${safeSession} turn ${turn} answer received after ${Math.round((Date.now() - startTime) / 1000)}s`);
         return { content: [{ type: "text", text: data.reply || "(empty reply)" }] };
       } catch {
         // The answer file may still be mid-write.
@@ -192,10 +210,11 @@ async function handleRequest(request) {
     if (typeof message !== "string" || !message.trim()) {
       return makeError(id, -32602, "message is required");
     }
+    const sessionId = params.arguments && params.arguments.session_id;
     return {
       jsonrpc: "2.0",
       id,
-      result: await reportToOrchestrator(message, params._meta),
+      result: await reportToOrchestrator(message, sessionId, params._meta),
     };
   }
 

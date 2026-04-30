@@ -55,11 +55,14 @@ _SAVED_STATS_RE = re.compile(
 )
 _ELIGIBLE_TERMINAL_RE = re.compile(
     r"^\s*(?:"
-    r"git\s+(?:status|log|diff|add|commit|push|pull|fetch|clone|branch|checkout|switch|merge|stash|tag|reset|remote|show|grep|ls-files)\b|"
+    r"git\s+(?:status|log|diff|show|grep|ls-files|rev-parse|merge-base|describe)\b|"
+    r"git\s+branch\s*(?:$|(?:--show-current|-a\b|-r\b|--all\b|--list\b|-vv?\b))|"
+    r"git\s+remote\s*(?:$|(?:-v\b|show\b|get-url\b))|"
+    r"git\s+worktree\s+list\b|"
     r"docker\s+(?:build|ps|images|logs|compose|exec|network|inspect)\b|"
     r"(?:npm|pnpm|yarn|bun)\s+(?:install|test|run|list|outdated|audit|build|lint)\b|"
     r"cargo\s+(?:build|test|check|clippy|fmt)\b|"
-    r"gh\s+(?:pr|issue|run)\s+(?:list|view|create|status|checks)\b|"
+    r"gh\s+(?:status\b|pr\s+(?:list|view|status|checks|diff)\b|issue\s+(?:list|view)\b|run\s+(?:list|view|watch)\b|workflow\s+(?:list|view)\b|release\s+(?:list|view)\b|repo\s+(?:list|view)\b)|"
     r"kubectl\s+(?:get|logs|describe|apply|top)\b|"
     r"(?:python|python3)\s+(?:-m\s+)?(?:pip|pytest|ruff|poetry|uv)\b|"
     r"(?:pip|pip3|poetry|uv)\s+(?:install|list|outdated|run|sync|lock|tree)\b|"
@@ -67,7 +70,9 @@ _ELIGIBLE_TERMINAL_RE = re.compile(
     r"(?:tsc|next|vite)\s+(?:build|dev|lint|test)?\b|"
     r"(?:rubocop|bundle|rake|rails)\b|"
     r"(?:jest|vitest|pytest|go\s+test|playwright|rspec|minitest)\b|"
-    r"terraform\s+(?:plan|validate|fmt|show|output|state\s+list)\b|"
+    r"(?:terraform|tofu|terragrunt)\s+(?:plan|validate|show|output|state\s+list)\b|"
+    r"(?:terraform|tofu|terragrunt)\s+fmt\s+(?:-check\b|--check\b)|"
+    r"(?:\.\/)?tf\.sh\s+(?:plan|validate|show|output|state\s+list)\b|"
     r"(?:make|mvn|maven|gradle|dotnet|flutter|dart)\b|"
     r"(?:curl|grep|rg|find|ls|wget|env|jq|pwd|tree|cat|head|tail)\b"
     r")"
@@ -79,6 +84,15 @@ _UNSAFE_TERMINAL_RE = re.compile(
     r"terraform\s+(?:apply|destroy)|kubectl\s+delete|docker\s+(?:rm|rmi|prune)|"
     r"gh\s+(?:auth|secret)\b"
     r")\b",
+    re.IGNORECASE,
+)
+_LEADING_CD_RE = re.compile(r"^\s*cd\s+(?P<path>(?:'[^']+'|\"[^\"]+\"|[^;&|]+))\s*&&\s*(?P<rest>.+)$", re.DOTALL)
+_LEADING_SLEEP_RE = re.compile(r"^\s*sleep\s+(?P<delay>\d+(?:\.\d+)?[smhd]?)\s*&&\s*(?P<rest>.+)$", re.DOTALL)
+_SENSITIVE_READ_RE = re.compile(
+    r"("
+    r"\bsecret\b|\btoken\b|\bpassword\b|\bcredential\b|"
+    r"terraform\.tfstate|\.cloudflare/|wrangler\s+secret|gh\s+secret"
+    r")",
     re.IGNORECASE,
 )
 
@@ -181,6 +195,19 @@ def route_terminal_command(
     cfg = _load_routing_config()
     if not cfg.enabled or not cfg.route_terminal or not _available(cfg):
         return None
+    sensitive_reason = _sensitive_read_reason(command)
+    if sensitive_reason:
+        return json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": sensitive_reason,
+                "status": "blocked",
+                "lean_ctx": True,
+                "tool": "lean-ctx safety",
+            },
+            ensure_ascii=False,
+        )
     if not _is_safe_read_only_command(command):
         return None
     effective_timeout = timeout or cfg.timeout_seconds
@@ -222,9 +249,34 @@ def _is_safe_read_only_command(command: str) -> bool:
     stripped = (command or "").strip()
     if not stripped:
         return False
-    if _UNSAFE_TERMINAL_RE.search(stripped):
+    normalized = _normalize_command_for_eligibility(stripped)
+    if _UNSAFE_TERMINAL_RE.search(normalized):
         return False
-    return bool(_ELIGIBLE_TERMINAL_RE.match(stripped))
+    return bool(_ELIGIBLE_TERMINAL_RE.match(normalized))
+
+
+def _normalize_command_for_eligibility(command: str) -> str:
+    stripped = (command or "").strip()
+    previous = None
+    normalized = stripped
+    while normalized and normalized != previous:
+        previous = normalized
+        for pattern in (_LEADING_SLEEP_RE, _LEADING_CD_RE):
+            match = pattern.match(normalized)
+            if match:
+                normalized = match.group("rest").strip()
+                break
+    return normalized
+
+
+def _sensitive_read_reason(command: str) -> str | None:
+    normalized = _normalize_command_for_eligibility(command)
+    if _SENSITIVE_READ_RE.search(normalized):
+        return (
+            "Blocked sensitive read-style terminal command. Use the appropriate "
+            "secrets/config inspection workflow and avoid printing secret-bearing files."
+        )
+    return None
 
 
 def get_session_savings() -> dict[str, int]:

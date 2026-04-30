@@ -104,11 +104,11 @@ delegate_task(
 )
 ```
 
-Use `persona_provider="cursor-agent"` for Cursor-backed code/test workers, for example with `persona_model="gpt-5.5-extra-high"` when that model is available locally. The local CLI owns its own auth in bridge mode.
+Use Cursor-backed personas for implementation/fix work, for example with `persona_model="gpt-5.5-extra-high"` when that model is available locally. Review and verification personas should use Claude Opus unless a call explicitly overrides the provider. The local CLI owns its own auth in bridge mode.
 
-Only canonical persona provider names are accepted: `claude` and `cursor-agent`. If a call omits `persona_provider`, Hermes uses `delegation.persona_provider` when configured. If neither is set, plain delegation keeps the embedded API path, while a named `persona` is rejected instead of guessing a local CLI provider. To intentionally keep embedded API execution, omit `persona` or set `transport="embedded-api"`; in that embedded case the persona name is not expanded into local CLI context.
+Only canonical persona provider names are accepted: `claude` and `cursor-agent`. If a call omits `persona_provider`, Hermes applies built-in role routing first: implementation/fix personas default to Cursor Agent with GPT, and review/verification/design/research personas default to Claude Opus. `delegation.persona_provider` is the fallback only for unclassified personas. To intentionally keep embedded API execution, omit `persona` or set `transport="embedded-api"`; in that embedded case the persona name is not expanded into local CLI context.
 
-Claude bridge workers receive a strict generated MCP config. Add optional worker MCPs through `delegation.bridge_extra_mcp_servers` and allow only the specific Claude tools needed by workers through `delegation.bridge_extra_allowed_tools`; this keeps unrelated project MCPs out of child sessions. Cursor bridge workers use project Cursor MCP config plus `--approve-mcps`; Hermes writes the worker bridge entry and merges configured extra MCP servers, but Cursor still does not use Claude-style `--mcp-config` flags.
+Claude bridge workers receive a strict generated MCP config. Add optional worker MCPs through `delegation.bridge_extra_mcp_servers` and allow only the specific Claude tools needed by workers through `delegation.bridge_extra_allowed_tools`; this keeps unrelated project MCPs out of child sessions. When native `lean_ctx` is enabled and exposed to bridge workers, Hermes adds the same packaged bridge-safe lean-ctx facade for both Claude and Cursor workers, limited to stateless `bridge_safe_tools`. Cursor bridge workers use project Cursor MCP config plus `--approve-mcps`; Hermes writes the worker bridge entry and merges configured extra MCP servers, but Cursor still does not use Claude-style `--mcp-config` flags.
 
 :::warning The Context Problem
 Subagents know **absolutely nothing** about your conversation. They start completely fresh. If you delegate "fix the bug we were discussing," the subagent has no idea what bug you mean. Always pass file paths, error messages, project structure, and constraints explicitly.
@@ -243,7 +243,8 @@ Restricting toolsets keeps the subagent focused and prevents accidental side eff
 
 ### Recommended Transport Patterns
 
-- **Review/test/code workers:** use `persona` with canonical `persona_provider="claude"` or `persona_provider="cursor-agent"` and `transport="bridge"` when you need local CLI tools, interactive bridge follow-up, or CLI-owned auth.
+- **Implementation/fix workers:** use Cursor Agent with GPT through persona routing, or explicitly set `persona_provider="cursor-agent"` and `transport="bridge"` when needed.
+- **Review/verification/design workers:** use Claude Opus through persona routing, or explicitly set `persona_provider="claude"` and `transport="bridge"` when needed.
 - **Cheap parallel reasoning:** use embedded API workers with `delegation.default_transport: "embedded-api"` plus a lower-cost `delegation.model` and provider.
 - **Legacy CLI compatibility:** use `simple-pipe` only when you intentionally need the old one-shot subprocess behavior.
 - **OAuth/proxy experiments:** use `experimental-oauth` only by explicit config or per-call transport. It is not selected by `auto` and carries provider policy risk.
