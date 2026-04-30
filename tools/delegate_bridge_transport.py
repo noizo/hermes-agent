@@ -415,22 +415,7 @@ def _bridge_context_tool_guidance(runtime_metadata: dict[str, Any] | None) -> li
         return []
 
     return [
-        "LEANCTX WORKER CONTRACT: LeanCTX MCP tools are available to this worker. Follow the same preference model installed by `lean-ctx setup`: prefer LeanCTX tools over native equivalents whenever they fit.",
-        "Bridge LeanCTX is a fail-fast helper: try the matching ctx_* tool first, and if it errors, times out, or lacks the needed detail, continue with native tools and mention the fallback in your next report.",
-        "During work:",
-        "- ctx_read: default for file reads; full for files you will edit, map for context-only files, signatures for API surface, diff after edits, lines:N-M for surgical ranges, task/reference for task-relevant or cross-reference reads, auto when unsure.",
-        "- ctx_multi_read: batch related file reads instead of repeated single-file calls when available.",
-        "- ctx_smart_read: use when you know the target but want LeanCTX to choose the best read mode.",
-        "- ctx_delta: use after you or another worker changed a file and you only need changed lines.",
-        "- ctx_search: regex/content search with compact results; prefer before broad shell search.",
-        "- ctx_tree: compact directory maps before reading many files.",
-        "- ctx_shell: non-mutating local commands with compressed output; use raw only when exact output is required.",
-        "- ctx_symbol and ctx_callers: use for named functions/classes and call-site analysis.",
-        "Tool preference map: ctx_tree over ls/tree/find, ctx_read over Read/cat/head/tail/sed, ctx_search over grep/rg/find-by-content, and ctx_shell over raw shell for git/gh/test/build/status commands.",
-        "- ctx_gain/ctx_cost: use for savings/cost evidence when asked or when reporting context efficiency matters.",
-        "Keep LeanCTX output ephemeral: summarize relevant evidence and avoid pasting large raw dumps into bridge reports.",
-        "Deliver context back to Hermes through report_to_orchestrator. Final reports should include ctx_* tools used, any LeanCTX fallback reason, and concise evidence produced.",
-        "Available LeanCTX tool handles: " + ", ".join(ctx_tools),
+        f"LeanCTX: prefer ctx_tree (ls), ctx_read (cat), ctx_search (grep), ctx_shell (git/build) over native tools. Fail-fast — fall back to native on error. Available: {', '.join(ctx_tools)}",
     ]
 
 
@@ -446,15 +431,11 @@ def _bridge_preamble(
         else "WRITE POLICY: Read-only. Do not edit, create, delete, or run mutating commands; report needed changes instead."
     )
     parts = [
-        "ORCHESTRATION MODE: You are a worker agent supervised by Hermes.",
-        "Communicate with the parent ONLY through the report_to_orchestrator MCP tool.",
-        "Your first action must call report_to_orchestrator with a one-line acknowledgement and plan.",
-        "Prefix every report_to_orchestrator message with [session_id=HERMES_RUNTIME_CONTEXT.bridge.session_id].",
+        f"ORCHESTRATION: Hermes bridge worker ({worker_type}).",
+        f"Use report_to_orchestrator for all communication — ACK first, then progress, questions, final results.",
+        f"Prefix messages: [session_id=HERMES_RUNTIME_CONTEXT.bridge.session_id]",
         write_policy,
-        "Call report_to_orchestrator for clarifying questions, progress, final results, or blockers.",
-        "Keep bridge messages concise. Do not inspect secrets or tokens.",
-        "Stop only when the task is complete and reported, the parent says stop/done, or you hit a fatal error.",
-        f"WORKER TYPE: {worker_type}",
+        "Stop: task complete+reported, parent says stop/done, or fatal error.",
     ]
     parts.extend(_bridge_context_tool_guidance(runtime_metadata))
     if runtime_metadata:
@@ -476,6 +457,10 @@ def _build_worker_command(
     bridge_server: Path,
     cfg: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
+    # Strip lean-ctx bootstrap — bridge workers query on demand via MCP tools.
+    # This cuts 5-15K tokens from the initial prompt.
+    prompt = _strip_lean_ctx_bootstrap(prompt)
+
     if worker_type == "claude":
         mcp_config = _write_claude_mcp_config(session_dir, root, session_id, bridge_server, cfg)
         args = [
@@ -525,7 +510,26 @@ def _build_worker_command(
     raise ValueError(f"unsupported bridge worker: {worker_type}")
 
 
-def _load_state(root: Path, session_id: str) -> dict[str, Any]:
+def _strip_lean_ctx_bootstrap(prompt: str) -> str:
+    """Remove the massive lean-ctx delegation context block injected by context-bootstrap.
+
+    Bridge workers have lean-ctx MCP tools available for on-demand queries
+    (ctx_overview, ctx_tree, ctx_read, etc.). Pre-injecting overview+graph+
+    wakeup+knowledge+bootstrap is redundant and inflates the initial prompt by
+    5-15K tokens, causing Opus workers to take 10-15 minutes before their first
+    report_to_orchestrator call.
+    """
+    import re
+    # Strip the <lean-ctx_delegation_context>...</lean-ctx_delegation_context> block
+    prompt = re.sub(
+        r'<lean-ctx_delegation_context>.*?</lean-ctx_delegation_context>',
+        '',
+        prompt,
+        flags=re.DOTALL,
+    )
+    # Collapse multiple blank lines
+    prompt = re.sub(r'\n{3,}', '\n\n', prompt)
+    return prompt.strip()
     try:
         return json.loads(_state_file(root, session_id).read_text(encoding="utf-8"))
     except Exception:
