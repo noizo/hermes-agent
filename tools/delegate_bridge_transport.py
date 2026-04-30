@@ -530,6 +530,9 @@ def _strip_lean_ctx_bootstrap(prompt: str) -> str:
     # Collapse multiple blank lines
     prompt = re.sub(r'\n{3,}', '\n\n', prompt)
     return prompt.strip()
+
+
+def _load_state(root: Path, session_id: str) -> dict[str, Any]:
     try:
         return json.loads(_state_file(root, session_id).read_text(encoding="utf-8"))
     except Exception:
